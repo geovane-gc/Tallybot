@@ -1,0 +1,67 @@
+# Fonte da verdade da configuração do Hermes. O bootstrap copia este arquivo
+# para data/config.yaml, que é o que o container lê — edite aqui, não lá.
+#
+# Chaves ausentes herdam o default do Hermes.
+
+# Sem esta chave o migrador trata o arquivo como anterior à v12 e recusa migrar.
+_config_version: 33
+
+model:
+  # Id conferido na API da OpenRouter, não na documentação (que cita uma
+  # variante antiga `nvidia/nemotron-3-ultra:free`). O sufixo `:free` é o que
+  # mantém a chamada sem custo.
+  #
+  # Este modelo não tem visão. Para ler foto de comprovante, troque por
+  # google/gemma-4-31b-it:free (tools + visão) e rode `make restart`.
+  default: "nvidia/nemotron-3-ultra-550b-a55b:free"
+  provider: "openrouter"
+
+agent:
+  # O default do Hermes é 500. No tier free da OpenRouter cada iteração consome
+  # uma requisição da cota diária, e um gasto precisa de 2 ou 3 — 500 queimaria
+  # o dia inteiro numa mensagem.
+  max_turns: 30
+  gateway_timeout: 600
+
+# Recomendado pela documentação para gateway sem supervisão humana; o default é
+# false, pensado em sessão interativa onde alguém lê os avisos.
+tool_loop_guardrails:
+  hard_stop_enabled: true
+  hard_stop_after:
+    exact_failure: 4
+    idempotent_no_progress: 4
+
+# Lista enxuta em vez do preset `hermes-telegram`, que traz browser, image_gen,
+# tts, vision e web. Cada ferramenta gasta tokens de definição em todo turno.
+platform_toolsets:
+  telegram:
+    - terminal
+    - skills
+    - memory
+    - cronjob
+
+platforms:
+  telegram:
+    reply_to_mode: "off"
+    guest_mode: false
+
+terminal:
+  # O container já é o sandbox; o backend docker criaria container dentro de
+  # container sem ganho.
+  backend: "local"
+
+# Bot de texto. O provider default é o faster-whisper local, que baixaria
+# ~150 MB no primeiro áudio. Para habilitar áudio: `enabled: true` e
+# `make restart` — a transcrição local é gratuita, não precisa de chave.
+stt:
+  enabled: false
+  language: "pt"
+
+compression:
+  enabled: true
+
+skills:
+  # O SKILL.md depende de ${HERMES_SKILL_DIR} ser substituído.
+  template_vars: true
+  # Snippets !`cmd` rodariam sem aprovação, e não precisamos deles.
+  inline_shell: false
