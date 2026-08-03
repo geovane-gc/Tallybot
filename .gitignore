@@ -1,0 +1,29 @@
+# Segredos — chaves da OpenRouter e token do bot
+.env
+
+# Estado do Hermes e o banco de dados financeiro.
+# Tudo aqui é gerado em runtime e contém dados pessoais: histórico de conversas,
+# memórias do agente e todos os seus lançamentos.
+/data/
+
+# Exceção: a skill é montada de ./skills e versionada normalmente.
+
+# Backups gerados por `make backup`
+/backups/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# macOS
+.DS_Store
+
+# Editores
+.idea/
+*.swp
+
+# Node
+node_modules/
