@@ -1,0 +1,6 @@
+{
+  "name": "financas-skill",
+  "private": true,
+  "type": "module",
+  "//": "Só declara o tipo de módulo. A skill é montada sozinha em /opt/data/skills/financas dentro do container, sem o package.json da raiz do repo — sem este arquivo, o Node dependeria de detecção por sintaxe. Não há dependências: fin.ts usa apenas node:sqlite, node:util e node:fs."
+}
