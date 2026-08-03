@@ -18,7 +18,7 @@ você:      /newbot
 BotFather: Alright, a new bot. How are we going to call it?
 você:      Meu Controle Financeiro          ← nome de exibição, livre
 BotFather: Good. Now let's choose a username for your bot.
-você:      geovane_financas_bot             ← precisa terminar em "bot" e ser único
+você:      geovane_tally_bot             ← precisa terminar em "bot" e ser único
 BotFather: Done! Use this token to access the HTTP API:
            7123456789:AAF-abcdefgh...       ← este é o TELEGRAM_BOT_TOKEN
 ```
@@ -70,7 +70,7 @@ crédito só serve para destravar o limite. É o único gasto que vale a pena.
 ## 4. Configurar
 
 ```bash
-cd financas-bot
+cd tallybot
 cp .env.example .env
 ```
 
@@ -127,18 +127,18 @@ Cria cinco rotinas:
 
 | Job | Quando | O que faz |
 |---|---|---|
-| `financas-recorrentes` | 06:00 todo dia | Lança as despesas fixas vencidas |
-| `financas-alertas` | 09h, 15h e 21h | Avisa se algum limite apertou |
-| `financas-diario` | 21:00 todo dia | Resumo do dia (silencioso se não houve gasto) |
-| `financas-semanal` | Domingo 20:00 | Fechamento da semana |
-| `financas-mensal` | Dia 1º, 09:00 | Fechamento do mês + planilha CSV |
+| `tally-recurring` | 06:00 todo dia | Lança as despesas fixas vencidas |
+| `tally-alerts` | 09h, 15h e 21h | Avisa se algum limite apertou |
+| `tally-daily` | 21:00 todo dia | Resumo do dia (silencioso se não houve gasto) |
+| `tally-weekly` | Domingo 20:00 | Fechamento da semana |
+| `tally-monthly` | Dia 1º, 09:00 | Fechamento do mês + planilha CSV |
 
 Os horários são de Brasília: o container roda com `TZ=America/Sao_Paulo`.
 
 Conferir: `make cron-list`. Testar um agora, sem esperar:
 
 ```bash
-docker compose exec hermes hermes cron run financas-diario
+docker compose exec hermes hermes cron run tally-daily
 ```
 
 ## 7. Primeira conversa
@@ -159,8 +159,8 @@ Você deve receber a confirmação com o número do lançamento. Confira que gra
 de verdade, direto no banco, sem passar pelo modelo:
 
 ```bash
-make saldo
-make resumo
+make balance
+make summary
 ```
 
 ## Configuração inicial recomendada
@@ -198,7 +198,7 @@ o dia virar (o reset é em UTC) ou compre os US$ 10 de crédito.
 acessível:
 
 ```bash
-docker compose exec hermes node /opt/data/skills/financas/scripts/fin.ts saldo
+docker compose exec hermes node /opt/data/skills/finance/scripts/fin.ts balance
 ```
 
 Se isso funcionar e o bot ainda não registrar, o problema é o modelo não chamando

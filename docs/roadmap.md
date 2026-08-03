@@ -65,13 +65,13 @@ let s = ""; process.stdin.on("data", d => s += d).on("end", () => {
 
 ## Fatura de cartão de verdade
 
-Hoje `saldo` mostra `fatura_mes_fmt`, que é o gasto do mês corrente naquele
+Hoje `balance` mostra `month_bill_fmt`, que é o gasto do mês corrente naquele
 cartão. Não é a fatura real: uma compra de 28/07 num cartão que fecha dia 25 cai
 na fatura de agosto, não na de julho.
 
-As colunas `dia_fechamento` e `dia_vencimento` já existem no schema, sem uso. O
+As colunas `closing_day` e `due_day` já existem no schema, sem uso. O
 que falta é uma função de ciclo — dado um cartão e uma data, em qual fatura a
-compra cai — e um subcomando `fatura` que agrupe por ciclo em vez de por mês
+compra cai — e um subcomando `bill` que agrupe por ciclo em vez de por mês
 civil. É o próximo passo mais útil para quem vive de cartão.
 
 ## Vários usuários
@@ -80,7 +80,7 @@ O schema não tem coluna de usuário. Dois IDs na allowlist dividiriam a mesma
 carteira, o que pode até ser o desejado num casal com finanças conjuntas — mas é
 bom saber que é o comportamento.
 
-Para separar: `usuario_id` nas tabelas, filtro em todas as consultas, e o gateway
+Para separar: `user_id` nas tabelas, filtro em todas as consultas, e o gateway
 já entrega o ID do remetente do Telegram para o agente. É uma migration nova em
 `MIGRATIONS` (nunca editar a versão 1, que já está aplicada) mais o filtro no
 `fin.ts`.
@@ -93,11 +93,11 @@ histórico de uma vez.
 
 A parte difícil não é ler o arquivo, é a deduplicação: reimportar o mesmo extrato
 não pode duplicar lançamento. O caminho é um hash de idempotência sobre
-`(data, valor, descrição normalizada)`, comparado antes de inserir.
+`(date, amount, descrição normalizada)`, comparado antes de inserir.
 
 ## Gráficos
 
-O `resumo` já devolve os dados agregados. Gerar um PNG de pizza por categoria ou
+O `summary` já devolve os dados agregados. Gerar um PNG de pizza por categoria ou
 de linha por mês, e mandar como imagem no Telegram, é bem visual num relatório
 mensal.
 
@@ -108,9 +108,9 @@ converter, ou usar a skill `xlsx` do Hermes para produzir planilha com gráfico.
 
 Com histórico suficiente, projetar: "no ritmo atual você fecha o mês em R$ 4.200,
 R$ 300 acima do seu limite". Média dos últimos N dias × dias restantes, mais as
-recorrentes ainda não lançadas — que o banco já conhece, via `proxima_data`.
+recorrentes ainda não lançadas — que o banco já conhece, via `next_date`.
 
-Isso encaixa bem no `alertas`, avisando **antes** de estourar em vez de depois.
+Isso encaixa bem no `alerts`, avisando **antes** de estourar em vez de depois.
 
 ## Ajustando o comportamento
 
@@ -120,7 +120,7 @@ mudanças ali valem imediatamente após `make restart`:
 - Muito ou pouco verboso? A seção "Como você se comunica".
 - Perguntando demais? A seção "Quando perguntar" no `SKILL.md`.
 - Categorizando errado com frequência? Acrescente os termos que você usa em
-  `skills/financas/references/categorias.md`.
+  `skills/finance/references/categories.md`.
 - Quer relatório em outro horário? `hermes/cron-jobs.sh`, depois
   `make cron-install`.
 

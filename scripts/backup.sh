@@ -1,49 +1,49 @@
 #!/usr/bin/env bash
 #
-# Backup do banco financeiro.
+# Backs up the ledger.
 #
-# Usa a API de backup do SQLite em vez de copiar o arquivo: o container pode
-# estar escrevendo durante a cópia e, em modo WAL, um `cp` capturaria estado
-# inconsistente.
+# Uses SQLite's own backup path rather than copying the file: the container may
+# be writing mid-copy and, in WAL mode, a plain `cp` would capture inconsistent
+# state.
 #
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-DB="data/financas/financas.db"
+DB="data/finance/tally.db"
 DEST="backups"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 
 if [[ ! -f "$DB" ]]; then
-  echo "Banco não encontrado em $DB." >&2
+  echo "No database found at $DB." >&2
   exit 1
 fi
 
 mkdir -p "$DEST"
-OUT="$DEST/financas-$STAMP.db"
+OUT="$DEST/tally-$STAMP.db"
 
-# Caminhos por env, não por argumento: em `node -e`, process.argv não tem o
-# caminho do script na posição 1, então o índice dos argumentos muda em relação
-# a um arquivo normal — fonte fácil de erro silencioso.
-ORIGEM="$DB" DESTINO="$OUT" node --input-type=module -e '
+# Paths through the environment, not as arguments: with `node -e`, process.argv
+# has no script path at index 1, so argument indexes shift compared to a real
+# file — an easy source of silent bugs.
+SOURCE_DB="$DB" TARGET_DB="$OUT" node --input-type=module -e '
 import { DatabaseSync } from "node:sqlite";
-// Sem `readOnly`: em modo WAL, uma conexão somente-leitura precisa do arquivo
-// -shm, que não existe quando ninguém tem o banco aberto — e ela não pode
-// criá-lo, falhando com "unable to open database file". VACUUM INTO não altera
-// a origem, e gera um destino íntegro e compactado mesmo com o container
-// escrevendo em paralelo.
-const db = new DatabaseSync(process.env.ORIGEM);
-// Caminho como parâmetro, não interpolado: `VACUUM INTO ?` aceita bind, e assim
-// não há escape de aspas para errar (aspas duplas o SQLite leria como nome de
-// coluna, não como texto).
-db.prepare("VACUUM INTO ?").run(process.env.DESTINO);
+// No `readOnly`: in WAL mode a read-only connection needs the -shm file, which
+// does not exist when nobody has the database open — and it is not allowed to
+// create one, failing with "unable to open database file". VACUUM INTO does not
+// touch the source, and produces an intact, compacted target even while the
+// container writes.
+const db = new DatabaseSync(process.env.SOURCE_DB);
+// The path is bound, not interpolated: `VACUUM INTO ?` accepts a parameter, so
+// there is no quote escaping to get wrong (SQLite would read double quotes as a
+// column name rather than as text).
+db.prepare("VACUUM INTO ?").run(process.env.TARGET_DB);
 db.close();
 '
 
 gzip -f "$OUT"
 echo "Backup: $OUT.gz"
 
-# Mantém os 30 mais recentes. Loop em vez de `xargs -r`, que o BSD/macOS não tem.
-ls -1t "$DEST"/financas-*.db.gz 2>/dev/null | tail -n +31 | while read -r old; do
+# Keep the 30 most recent. A loop instead of `xargs -r`, which BSD/macOS lacks.
+ls -1t "$DEST"/tally-*.db.gz 2>/dev/null | tail -n +31 | while read -r old; do
   rm -f -- "$old"
 done

@@ -1,7 +1,10 @@
-# financas-bot
+# Tally
 
 Agente financeiro pessoal no Telegram. Você manda "uber 27", ele categoriza,
 guarda em SQLite e devolve relatórios, alertas de limite e fechamentos mensais.
+
+O bot conversa em português. O código é em inglês — a divisão está explicada em
+[Idiomas](#idiomas) mais abaixo.
 
 Construído sobre o [Hermes Agent](https://github.com/NousResearch/hermes-agent)
 da Nous Research, rodando em Docker, com modelo gratuito via OpenRouter.
@@ -9,31 +12,31 @@ da Nous Research, rodando em Docker, com modelo gratuito via OpenRouter.
 ```
 você  ─────────►  Telegram  ─────────►  Hermes (container)
                                             │
-                                            ├─ SOUL.md ......... persona e caminho rápido
-                                            ├─ skill financas .. referência completa
-                                            ├─ fin.ts .......... toda a lógica financeira
-                                            └─ SQLite .......... seus dados, no seu disco
+                                            ├─ SOUL.md ........ persona e caminho rápido
+                                            ├─ skill finance .. referência completa
+                                            ├─ fin.ts ......... toda a lógica financeira
+                                            └─ SQLite ......... seus dados, no seu disco
 ```
 
 ## Como funciona uma conversa
 
 ```
 você:  mercado 234,56
-bot:   ✅ R$ 234,56 · Mercado · hoje · Nubank (#87)
+Tally: ✅ R$ 234,56 · Mercado · hoje · Nubank (#87)
 
 você:  89,90 no ifood ontem
-bot:   ✅ R$ 89,90 · Delivery · ontem · Nubank (#88)
+Tally: ✅ R$ 89,90 · Delivery · ontem · Nubank (#88)
        🟡 Alimentação: R$ 324,46 de R$ 400,00 este mês.
 
 você:  quanto gastei esse mês?
-bot:   💸 R$ 1.724,46 este mês, em 12 lançamentos.
+Tally: 💸 R$ 1.724,46 este mês, em 12 lançamentos.
        A maior fatia foi Moradia (R$ 1.234,56). Está 8% abaixo do mês passado.
 
 você:  limite de 500 pra alimentação
-bot:   ✅ Limite de R$ 500,00 em Alimentação. Aviso quando chegar a 80%.
+Tally: ✅ Limite de R$ 500,00 em Alimentação. Aviso quando chegar a 80%.
 
 você:  notebook 3600 em 12x no nubank
-bot:   ✅ Notebook R$ 3.600,00 em 12x de R$ 300,00 · Nubank (#89)
+Tally: ✅ Notebook R$ 3.600,00 em 12x de R$ 300,00 · Nubank (#89)
        Última parcela em 03/07/2027.
 ```
 
@@ -86,9 +89,28 @@ make chat          # conversa pelo terminal, sem passar pelo Telegram
 make doctor        # diagnóstico: chaves, modelo, gateway
 make backup        # backup consistente do banco
 make test          # roda a suíte de testes
-make saldo         # consulta direta, sem gastar requisição do modelo
-make relatorio
+make balance       # consulta direta, sem gastar requisição do modelo
+make report
 ```
+
+## Idiomas
+
+A divisão é deliberada e vale para todo o repositório:
+
+| | Idioma | Por quê |
+|---|---|---|
+| Código, schema, comentários, chaves do JSON | **Inglês** | É o padrão da parte técnica, e mantém o código legível para qualquer pessoa |
+| `SKILL.md`, references, `SOUL.md` | **Inglês** | Ficam ao lado do código; instruem o bot a responder em português |
+| README e `docs/` | **Português** | São para você ler |
+| **Tudo que o bot te mostra** | **Português** | Mensagens de erro (o agente repassa no chat), nomes de categoria (aparecem nos relatórios) e o texto dos relatórios |
+
+Na prática: `error` no JSON vem em português porque vai direto para o Telegram;
+`amount_cents` é inglês porque ninguém além do código vê. A regra de bolso está
+escrita no topo do `db.ts` — se a string pode chegar ao Telegram, é português.
+
+Moeda é BRL, e o parser entende `1.234,56`, `1,2k` e `30 reais`. As categorias
+mapeiam estabelecimentos brasileiros: "ifood" vira Delivery, "99" vira Uber/99,
+"sabesp" vira Água.
 
 ## Sobre o custo
 
@@ -112,14 +134,14 @@ Para trocar de modelo, altere `model.default` em
 │   ├── config.yaml         Modelo, toolsets, guardrails  (fonte da verdade)
 │   ├── SOUL.md             Persona e o caminho rápido de lançamento
 │   └── cron-jobs.sh        Cria os relatórios agendados
-├── skills/financas/
+├── skills/finance/
 │   ├── SKILL.md            Referência completa que o agente carrega
 │   ├── scripts/
 │   │   ├── fin.ts          CLI: toda a lógica financeira
 │   │   └── db.ts           Schema, migrations e parsing de valor/data
 │   └── references/         Categorias, parsing PT-BR, relatórios, schema
 ├── scripts/                bootstrap e backup
-├── tests/                  122 testes, rodam sem credenciais
+├── tests/                  124 testes, rodam sem credenciais
 ├── docs/
 └── data/                   Estado e banco (fora do git)
 ```
@@ -132,21 +154,24 @@ build step. Não existe `node_modules`, `tsconfig` nem bundler para manter.
 
 Quatro decisões que explicam o resto do código:
 
-**Dinheiro é inteiro em centavos, nunca float** — e com tipo marcado
-(`Centavos`), o que impede passar reais onde se espera centavos. `R$ 0,10` somado
-cem vezes tem que dar exatamente `R$ 10,00`; com float daria 9,999999999999998, e
-o erro se acumularia em cada relatório mensal. Há teste cobrindo isso.
+**Dinheiro é inteiro em centavos, nunca float** — e com tipo marcado (`Cents`),
+o que impede passar reais onde se espera centavos. `R$ 0,10` somado cem vezes tem
+que dar exatamente `R$ 10,00`; com float daria 9,999999999999998, e o erro se
+acumularia em cada relatório mensal. Há teste cobrindo isso.
 
 **O modelo não calcula nada.** Nenhuma soma, data ou percentual passa pelo LLM.
 Ele decide *o que* registrar; o `fin.ts` decide *como*. Isso importa porque o
 Hermes não coloca a data atual no prompt (ele instrui o agente a rodar `date`),
 então um modelo tentando resolver "ontem" na própria cabeça erraria. Em vez
-disso, `--data ontem` é resolvido pelo script, com o fuso de São Paulo.
+disso, `--date ontem` é resolvido pelo script, com o fuso de São Paulo.
 
 **O caminho quente não custa um turno extra.** Registrar um gasto é 90% do uso,
 então esse fluxo vive no `SOUL.md`, que é injetado em toda sessão. A skill guarda
 a cauda longa e só é carregada quando necessário. Menos ida e volta, menos
 requisição, menos chance de erro.
+
+**Transferência não é despesa.** Mover dinheiro entre suas contas fica fora dos
+totais — é assim que pagar a fatura do cartão não conta o gasto duas vezes.
 
 Detalhes em [docs/arquitetura.md](docs/arquitetura.md).
 

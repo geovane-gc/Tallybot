@@ -1,14 +1,14 @@
-# Suba com `make up`, que roda o bootstrap antes de subir o container.
+# Start with `make up`, which runs the bootstrap before bringing the container up.
 
 services:
   hermes:
     image: nousresearch/hermes-agent:latest
-    container_name: financas-bot
+    container_name: tallybot
     restart: unless-stopped
     command: ["gateway", "run"]
 
     environment:
-      # Sem TZ o container roda em UTC e o cron dispara 3h adiantado.
+      # Without TZ the container runs in UTC and cron fires three hours early.
       TZ: America/Sao_Paulo
       HERMES_UID: ${HERMES_UID:-10000}
       HERMES_GID: ${HERMES_GID:-10000}
@@ -19,12 +19,12 @@ services:
       - .env
 
     ports:
-      # Só loopback: o dashboard expõe as chaves de API.
+      # Loopback only: the dashboard exposes API keys.
       - "127.0.0.1:${DASHBOARD_PORT:-9119}:9119"
 
     volumes:
       - ./data:/opt/data
-      - ./skills/financas:/opt/data/skills/financas
+      - ./skills/finance:/opt/data/skills/finance
 
     deploy:
       resources:
@@ -45,11 +45,11 @@ services:
         max-size: "10m"
         max-file: "3"
 
-# Notas de projeto (por que este arquivo difere do compose oficial do Hermes):
+# Design notes — why this file differs from the official Hermes compose:
 #
-#   * Rede bridge com portas publicadas, não `network_mode: host` — host
-#     networking não funciona no Docker Desktop, e o gateway do Telegram é só
-#     tráfego de saída (long polling).
-#   * Estado em ./data, não em ~/.hermes, para isolar este bot de outros agentes.
-#   * A skill é montada de ./skills e fica versionada no git; sendo read-write,
-#     melhorias que o próprio agente fizer aparecem como diff.
+#   * Bridge networking with published ports rather than `network_mode: host`:
+#     host networking does not work on Docker Desktop, and the Telegram gateway
+#     is outbound-only (long polling).
+#   * State lives in ./data, not ~/.hermes, isolating this bot from other agents.
+#   * The skill is mounted from ./skills and stays versioned in git; being
+#     read-write, any improvement the agent makes to it shows up as a diff.

@@ -6,8 +6,8 @@
    Telegram
       │  long polling (só tráfego de saída, nenhuma porta aberta)
       ▼
-┌─────────────────────────────────────────────────────────┐
-│ container financas-bot   (nousresearch/hermes-agent)    │
+┌──────────────────────────────────────────────────────────┐
+│ container tallybot          (nousresearch/hermes-agent)  │
 │                                                          │
 │  gateway ──► agente ──► modelo (OpenRouter, nemotron)    │
 │                 │                                        │
@@ -16,8 +16,8 @@
 │         node fin.ts <subcomando>                         │
 │                 │                                        │
 │                 ▼                                        │
-│         SQLite  /opt/data/financas/financas.db           │
-└─────────────────────────────────────────────────────────┘
+│         SQLite  /opt/data/finance/tally.db               │
+└──────────────────────────────────────────────────────────┘
       │
       ▼  volume
    ./data no host   (config, sessões, memórias, banco)
@@ -35,8 +35,8 @@ arquivo errado.
 | Camada | Arquivo | Quando é carregado | Para quê |
 |---|---|---|---|
 | Persona | `hermes/SOUL.md` | **Toda** sessão, automático | Quem o bot é, como escreve, e o caminho rápido de lançamento |
-| Referência | `skills/financas/SKILL.md` | Sob demanda (`skill_view`) | Todos os subcomandos e as regras completas |
-| Detalhe | `skills/financas/references/*.md` | Sob demanda, por arquivo | Taxonomia, parsing PT-BR, relatórios, schema |
+| Referência | `skills/finance/SKILL.md` | Sob demanda (`skill_view`) | Todos os subcomandos e as regras completas |
+| Detalhe | `skills/finance/references/*.md` | Sob demanda, por arquivo | Taxonomia, parsing PT-BR, relatórios, schema |
 
 **Por que dividir assim.** O Hermes injeta o `SOUL.md` em toda sessão, mas a
 skill só entra no contexto quando o agente pede. Registrar um gasto é 90% das
@@ -49,6 +49,28 @@ Não existe chave de configuração no Hermes para pré-carregar uma skill em se
 de gateway — conferi no `config_defaults.py`. O `--skill` do `cron create` cobre
 o caso dos relatórios agendados, e é por isso que os cron jobs o usam.
 
+## A divisão de idiomas
+
+O repositório é bilíngue de propósito, e a fronteira é uma pergunta só: **essa
+string pode chegar ao Telegram?**
+
+| | Idioma |
+|---|---|
+| Identificadores, comentários, tabelas, colunas, chaves do JSON | Inglês |
+| `SKILL.md`, `references/`, `SOUL.md`, compose, `Makefile`, scripts | Inglês |
+| README e `docs/` | Português |
+| Mensagens de `FinError`, nomes de categoria, rótulos de período, texto dos relatórios | Português |
+
+Por isso `{"ok": false, "error": "Conta \"Nubank\" não existe…"}` mistura os dois:
+a chave é inglês porque só o código a lê; o valor é português porque o agente o
+repassa palavra por palavra no chat. Mesma lógica em `period.label`, que entra no
+título do relatório, e em `categories.name`, que aparece em toda listagem.
+
+A regra está escrita no topo do `db.ts`, onde quem for mexer a encontra primeiro.
+
+Os prompts do `cron-jobs.sh` também são português: eles instruem o agente a
+produzir uma mensagem para você, e carregam os moldes de resposta.
+
 ## A regra central: o modelo não calcula
 
 Toda aritmética de dinheiro, data, percentual e orçamento vive no `fin.ts`. O
@@ -57,10 +79,10 @@ modelo decide **o que** registrar; nunca **como** calcular.
 Isso não é preciosismo. O Hermes deliberadamente **não** coloca a data atual no
 prompt do sistema — ele instrui o agente a rodar `date` no terminal quando
 precisar (`agent/prompt_builder.py`). Um modelo tentando resolver "ontem" de
-cabeça, sem saber que dia é hoje, erraria. Então `--data ontem` é passado
+cabeça, sem saber que dia é hoje, erraria. Então `--date ontem` é passado
 literalmente e resolvido pelo script, no fuso de São Paulo.
 
-O mesmo vale para valores: `--valor "1.234,56"` chega cru, e o parser trata o
+O mesmo vale para valores: `--amount "1.234,56"` chega cru, e o parser trata o
 formato brasileiro. Pedir ao modelo para "converter para float" seria convidar o
 erro.
 
@@ -76,11 +98,11 @@ A imagem do Hermes traz Node 26. Isso dá três coisas de graça:
 
 Consequência prática: `node_modules` não existe neste projeto. Os dois
 `package.json` só declaram `"type": "module"` — o da raiz para ergonomia de
-desenvolvimento, e o de `skills/financas/` porque a skill é montada sozinha em
-`/opt/data/skills/financas` dentro do container, sem enxergar a raiz do repo.
+desenvolvimento, e o de `skills/finance/` porque a skill é montada sozinha em
+`/opt/data/skills/finance` dentro do container, sem enxergar a raiz do repo.
 
-Os tipos pagam por si num lugar específico: `Centavos` é um tipo marcado
-(`number & { __marca }`), então passar reais onde se espera centavos não compila.
+Os tipos pagam por si num lugar específico: `Cents` é um tipo marcado
+(`number & { __brand }`), então passar reais onde se espera centavos não compila.
 É a classe de erro mais fácil de cometer em código financeiro.
 
 ## Contrato entre agente e ferramenta
@@ -88,8 +110,8 @@ Os tipos pagam por si num lugar específico: `Centavos` é um tipo marcado
 Toda chamada devolve JSON, sempre com a mesma forma:
 
 ```json
-{ "ok": true,  "lancamento": { … } }
-{ "ok": false, "erro": "Conta \"Nubank\" não existe. Rode `conta list`…" }
+{ "ok": true,  "transaction": { … } }
+{ "ok": false, "error": "Conta \"Nubank\" não existe. Rode `account list`…" }
 ```
 
 Duas propriedades importam:
@@ -97,21 +119,21 @@ Duas propriedades importam:
 **As mensagens de erro são escritas para o usuário final**, em português, falando
 de dinheiro e não de SQL. O agente pode repassá-las direto. Erro do `parseArgs`
 também é traduzido, e a mensagem lista as opções aceitas naquele subcomando — se
-o modelo inventa `--moeda`, ele recebe de volta o que existe.
+o modelo inventa `--currency`, ele recebe de volta o que existe.
 
 **A resposta do `add` já traz o orçamento afetado.** Se o gasto cruzou o limite, o
-campo `orcamento` vem com `situacao: "atencao"` na mesma resposta. O agente avisa
+campo `budget` vem com `status: "warning"` na mesma resposta. O agente avisa
 sem uma segunda chamada, economizando uma requisição em cada lançamento que
 importa.
 
 ## Modelo de dados
 
-Nove tabelas, uma view. O detalhe completo está em
-[`skills/financas/references/schema.md`](../skills/financas/references/schema.md).
+Onze tabelas, uma view. O detalhe completo está em
+[`skills/finance/references/schema.md`](../skills/finance/references/schema.md).
 
 Quatro decisões que moldam as consultas:
 
-**Centavos inteiros.** Nunca float, em nenhuma coluna.
+**Centavos inteiros (`amount_cents`).** Nunca float, em nenhuma coluna.
 
 **Categorias em dois níveis.** `Alimentação > Delivery`. Filtrar ou orçar a raiz
 inclui as filhas — sem isso, um teto em "Alimentação" ignoraria tudo que foi
@@ -121,7 +143,7 @@ lançado em "Delivery" e nunca fecharia com a soma das partes.
 de despesa e receita: mover dinheiro entre contas suas não é gasto. É assim que
 pagamento de fatura de cartão é registrado sem contar o gasto duas vezes.
 
-**Parcelas são lançamentos reais**, um por mês, unidos por `grupo_parcelas`. Não
+**Parcelas são lançamentos reais**, um por mês, unidos por `installment_group`. Não
 são um campo "12x" numa linha só. Assim a parcela cai no mês em que vence e o
 relatório de março mostra o que de fato pesa em março. A divisão preserva o
 centavo: R$ 100 em 3× vira 33,34 + 33,33 + 33,33.
@@ -131,11 +153,11 @@ centavo: R$ 100 em 3× vira 33,34 + 33,33 + 33,33.
 O cron checa limites três vezes ao dia. Sem controle, você receberia "Alimentação
 em 85%" às 9h, 15h e 21h, todos os dias até o fim do mês.
 
-A tabela `alertas_enviados` tem `(chave, mes, nivel)` como chave primária, e
-`alertas --marcar` registra o que já foi avisado. Subir de `atencao` para
-`estourado` conta como alerta novo, porque é informação nova.
+A tabela `sent_alerts` tem `(key, month, level)` como chave primária, e
+`alerts --mark` registra o que já foi avisado. Subir de `warning` para
+`over` conta como alerta novo, porque é informação nova.
 
-Quando não há nada a dizer, `alertas` devolve `silent: true` e o agente responde
+Quando não há nada a dizer, `alerts` devolve `silent: true` e o agente responde
 apenas `[SILENT]` — marcador que o Hermes reconhece e não entrega. Um bot que
 notifica sem motivo é um bot que você silencia.
 
@@ -157,14 +179,14 @@ Três camadas, cada uma resolvida onde importa:
    │
    ├─ gateway do Telegram valida o remetente contra TELEGRAM_ALLOWED_USERS
    ├─ SOUL.md já está no contexto: o agente sabe o caminho rápido
-   ├─ terminal: node fin.ts add --valor 89,90 --descricao "iFood"
-   │                            --categoria Delivery --conta Nubank --data ontem
-   │     ├─ parseValor("89,90")  -> 8990 centavos
-   │     ├─ parseData("ontem")   -> 2026-08-02 (fuso de São Paulo)
-   │     ├─ resolverCategoria    -> Delivery (subcategoria vence a raiz)
-   │     ├─ resolverConta        -> Nubank
+   ├─ terminal: node fin.ts add --amount 89,90 --description "iFood"
+   │                            --category Delivery --account Nubank --date ontem
+   │     ├─ parseAmount("89,90")   -> 8990 centavos
+   │     ├─ parseDate("ontem")     -> 2026-08-02 (fuso de São Paulo)
+   │     ├─ resolveCategory        -> Delivery (subcategoria vence a raiz)
+   │     ├─ resolveAccount         -> Nubank
    │     ├─ INSERT
-   │     └─ statusOrcamentoDaCategoria -> { situacao: "atencao", … }
+   │     └─ budgetForCategory      -> { status: "warning", … }
    │
    └─ "✅ R$ 89,90 · Delivery · ontem · Nubank (#88)
        🟡 Alimentação: R$ 324,46 de R$ 400,00 este mês."
@@ -186,7 +208,7 @@ escolher comandos errados, trocar `model.default` por
 
 **Um usuário.** O schema não tem coluna de usuário. Vários IDs na allowlist
 compartilhariam a mesma carteira. Para uso familiar, seria preciso adicionar
-`usuario_id` nas tabelas e filtrar por ele.
+`user_id` nas tabelas e filtrar por ele.
 
 **Sem áudio nem foto** nesta versão — ver [roadmap.md](roadmap.md), que descreve
 o que cada um exigiria.

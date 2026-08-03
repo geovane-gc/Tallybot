@@ -1,38 +1,39 @@
-# Fonte da verdade da configuração do Hermes. O bootstrap copia este arquivo
-# para data/config.yaml, que é o que o container lê — edite aqui, não lá.
+# Source of truth for the Hermes configuration. The bootstrap copies this file
+# to data/config.yaml, which is what the container reads — edit here, not there.
 #
-# Chaves ausentes herdam o default do Hermes.
+# Any key left out inherits the Hermes default.
 
-# Sem esta chave o migrador trata o arquivo como anterior à v12 e recusa migrar.
+# Without this key the migrator treats the file as pre-v12 and refuses to migrate.
 _config_version: 33
 
 model:
-  # Id conferido na API da OpenRouter, não na documentação (que cita uma
-  # variante antiga `nvidia/nemotron-3-ultra:free`). O sufixo `:free` é o que
-  # mantém a chamada sem custo.
+  # Id verified against the OpenRouter API, not the docs (which mention an older
+  # `nvidia/nemotron-3-ultra:free` variant). The `:free` suffix is what keeps the
+  # calls at no cost.
   #
-  # Este modelo não tem visão. Para ler foto de comprovante, troque por
-  # google/gemma-4-31b-it:free (tools + visão) e rode `make restart`.
+  # This model has no vision. To read a photo of a receipt, swap in
+  # google/gemma-4-31b-it:free (tools + vision) and run `make restart`.
   default: "nvidia/nemotron-3-ultra-550b-a55b:free"
   provider: "openrouter"
 
 agent:
-  # O default do Hermes é 500. No tier free da OpenRouter cada iteração consome
-  # uma requisição da cota diária, e um gasto precisa de 2 ou 3 — 500 queimaria
-  # o dia inteiro numa mensagem.
+  # The Hermes default is 500. On OpenRouter's free tier every iteration spends
+  # one request from the daily quota, and logging an expense takes 2 or 3 — 500
+  # would burn a whole day on a single message.
   max_turns: 30
   gateway_timeout: 600
 
-# Recomendado pela documentação para gateway sem supervisão humana; o default é
-# false, pensado em sessão interativa onde alguém lê os avisos.
+# Recommended by the docs for an unattended gateway; the default is false, which
+# suits interactive sessions where somebody reads the warnings.
 tool_loop_guardrails:
   hard_stop_enabled: true
   hard_stop_after:
     exact_failure: 4
     idempotent_no_progress: 4
 
-# Lista enxuta em vez do preset `hermes-telegram`, que traz browser, image_gen,
-# tts, vision e web. Cada ferramenta gasta tokens de definição em todo turno.
+# A lean list instead of the `hermes-telegram` preset, which brings browser,
+# image_gen, tts, vision and web. Every tool costs definition tokens on every
+# turn.
 platform_toolsets:
   telegram:
     - terminal
@@ -46,13 +47,13 @@ platforms:
     guest_mode: false
 
 terminal:
-  # O container já é o sandbox; o backend docker criaria container dentro de
-  # container sem ganho.
+  # The container is already the sandbox; the docker backend would nest a
+  # container inside a container for nothing.
   backend: "local"
 
-# Bot de texto. O provider default é o faster-whisper local, que baixaria
-# ~150 MB no primeiro áudio. Para habilitar áudio: `enabled: true` e
-# `make restart` — a transcrição local é gratuita, não precisa de chave.
+# A text-only bot. The default provider is local faster-whisper, which would
+# download ~150 MB on the first voice message. To enable audio: `enabled: true`
+# and `make restart` — local transcription is free, no API key needed.
 stt:
   enabled: false
   language: "pt"
@@ -61,7 +62,7 @@ compression:
   enabled: true
 
 skills:
-  # O SKILL.md depende de ${HERMES_SKILL_DIR} ser substituído.
+  # SKILL.md relies on ${HERMES_SKILL_DIR} being substituted.
   template_vars: true
-  # Snippets !`cmd` rodariam sem aprovação, e não precisamos deles.
+  # Inline !`cmd` snippets would run without approval, and we do not need them.
   inline_shell: false

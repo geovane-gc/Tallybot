@@ -241,16 +241,16 @@ começar. O bot escolhe a categoria sozinho; se errar, corrija e siga.
 Consultas rápidas, sem gastar requisição do modelo:
 
 ```bash
-make saldo
-make resumo
-make relatorio
+make balance
+make summary
+make report
 make export
 ```
 
 Ou a CLI completa:
 
 ```bash
-node skills/financas/scripts/fin.ts --db data/financas/financas.db --help
-node skills/financas/scripts/fin.ts --db data/financas/financas.db \
-    ls --periodo 30d --categoria Alimentação
+node skills/finance/scripts/fin.ts --db data/finance/tally.db --help
+node skills/finance/scripts/fin.ts --db data/finance/tally.db \
+    ls --period 30d --category Alimentação
 ```

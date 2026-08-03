@@ -1,0 +1,6 @@
+{
+  "name": "tally-finance-skill",
+  "private": true,
+  "type": "module",
+  "//": "Declares the module type, nothing else. The skill is mounted on its own at /opt/data/skills/finance inside the container, without the repo root package.json — without this file Node would fall back to syntax detection. There are no dependencies: fin.ts uses only node:sqlite, node:util and node:fs."
+}

@@ -1,11 +1,13 @@
-# Categorias e como encaixar cada gasto
+# Categories and where each expense belongs
 
-O banco já vem semeado com a árvore abaixo. Você não precisa criar nada para o
-dia a dia.
+The database ships seeded with the tree below. Category names are in Portuguese
+on purpose: they are data the user reads in every report, so they follow the
+bot's language rather than the codebase's. You do not need to create anything for
+day-to-day use.
 
-## A árvore
+## The tree
 
-| Categoria | Subcategorias |
+| Category | Subcategories |
 |---|---|
 | 🍽️ Alimentação | Mercado, Restaurante, Delivery, Padaria, Café |
 | 🚗 Transporte | Uber/99, Combustível, Estacionamento, Transporte público, Manutenção |
@@ -22,14 +24,17 @@ dia a dia.
 | 📈 Investimentos | Aporte, Resgate, Dividendos |
 | 💳 Dívidas | Fatura de cartão, Empréstimo, Financiamento |
 | ❓ Outros | — |
-| 💰 Salário *(receita)* | Salário, 13º, Férias, Bônus |
-| 💵 Renda extra *(receita)* | Freelance, Venda, Aluguel recebido, Reembolso, Cashback |
+| 💰 Salário *(income)* | Salário, 13º, Férias, Bônus |
+| 💵 Renda extra *(income)* | Freelance, Venda, Aluguel recebido, Reembolso, Cashback |
 
-Prefira sempre a **subcategoria**: `--categoria Delivery` em vez de
-`--categoria Alimentação`. Os relatórios agrupam na raiz automaticamente, então
-você ganha detalhe sem perder a visão geral.
+Always prefer the **subcategory**: `--category Delivery` rather than
+`--category Alimentação`. Reports roll up to the root automatically, so you gain
+detail without losing the overview.
 
-## Termos do dia a dia
+## Everyday Brazilian terms
+
+These are the merchants and words the user actually types. Keep them in mind
+before reaching for `Outros`.
 
 **Alimentação**
 `ifood`, `rappi`, `delivery`, `pedido` → Delivery ·
@@ -62,7 +67,7 @@ você ganha detalhe sem perder a visão geral.
 
 **Lazer**
 `netflix`, `spotify`, `disney`, `hbo`, `max`, `prime video`, `youtube premium` → Streaming
-(mas veja a nota sobre Assinaturas abaixo) ·
+(but see the note on Assinaturas below) ·
 `bar`, `cerveja`, `balada`, `boteco`, `chopp` → Bar ·
 `cinema`, `filme`, `ingresso` → Cinema ·
 `viagem`, `hotel`, `airbnb`, `passagem aérea`, `hospedagem` → Viagem ·
@@ -89,7 +94,7 @@ você ganha detalhe sem perder a visão geral.
 `tarifa`, `anuidade`, `taxa do banco` → Tarifa bancária ·
 `multa` → Multa · `juros`, `mora`, `rotativo` → Juros
 
-**Receitas**
+**Income**
 `salário`, `pagamento`, `contracheque`, `holerite` → Salário ·
 `13º`, `décimo terceiro` → 13º · `férias` → Férias · `bônus`, `plr` → Bônus ·
 `freela`, `freelance`, `bico`, `projeto`, `consultoria` → Freelance ·
@@ -97,44 +102,43 @@ você ganha detalhe sem perder a visão geral.
 `reembolso`, `estorno`, `devolução` → Reembolso ·
 `cashback`, `cesta`, `pontos` → Cashback
 
-## Decisões que dão dúvida
+## Judgement calls
 
-**Streaming: Lazer ou Assinaturas?** Ambas existem. Escolha uma e **mantenha a
-escolha** — inconsistência é o que estraga relatório. A convenção aqui é:
-entretenimento (Netflix, Disney, HBO, Spotify) vai em **Lazer > Streaming**;
-ferramenta de trabalho (GitHub, AWS, Claude, Notion) vai em
-**Assinaturas > Software**.
+**Streaming: Lazer or Assinaturas?** Both exist. Pick one and **stay
+consistent** — inconsistency is what ruins a report. The convention here:
+entertainment (Netflix, Disney, HBO, Spotify) goes to **Lazer > Streaming**; work
+tooling (GitHub, AWS, Claude, Notion) goes to **Assinaturas > Software**.
 
-**Pagamento de fatura de cartão** não é despesa nova — os gastos já foram
-lançados individualmente quando aconteceram. Registre como **transferência**
-da conta para o cartão:
+**Paying a credit card bill is not a new expense** — the individual purchases
+were already logged when they happened. Record it as a **transfer** from the
+account to the card:
 
-    add --tipo transferencia --valor 1234,56 --descricao "Pagamento fatura Nubank" \
-        --conta "Itaú" --conta-destino Nubank
+    add --type transfer --amount 1234,56 --description "Pagamento fatura Nubank" \
+        --account "Itaú" --dest-account Nubank
 
-Lançar como despesa contaria o gasto duas vezes e inflaria o mês inteiro.
+Logging it as an expense would count the spending twice and inflate the month.
 
-**PIX** é forma de pagamento, não categoria. Categorize pelo que foi comprado.
-"pix 80 pro mercado" é Mercado. Se for transferência para pessoa sem
-contrapartida (ajudar alguém, dividir conta), use `Família > Ajuda familiar` ou
-`Outros`, e registre a pessoa na descrição.
+**PIX is a payment method, not a category.** Categorise by what was bought:
+"pix 80 pro mercado" is Mercado. For a transfer to a person with nothing in
+return (helping someone, splitting a bill), use `Família > Ajuda familiar` or
+`Outros`, and name the person in the description.
 
-**Investimento** é dinheiro que continua sendo dele — não é gasto. Registre
-como transferência para a conta de investimento, se ela existir; senão, como
+**An investment is still the user's money** — not spending. Record it as a
+transfer to the investment account if one exists; otherwise as
 `Investimentos > Aporte`.
 
-**Empréstimo que ele fez a alguém** não é despesa (ele espera receber de
-volta). Use `Outros` com a tag `emprestimo` e deixe claro na descrição.
+**Money lent to someone** is not an expense (they expect it back). Use `Outros`
+with the tag `emprestimo` and make it explicit in the description.
 
-**Saque em dinheiro** é transferência da conta para `Carteira`, não despesa.
-O gasto vem depois, quando o dinheiro for usado.
+**A cash withdrawal** is a transfer from the account to `Carteira`, not an
+expense. The spending comes later, when the cash is used.
 
-## Criando categoria nova
+## Creating a new category
 
-Só quando algo recorrente não encaixar em nada:
+Only when something recurring fits nowhere:
 
-    fin.ts categoria add --nome "Doações" --tipo despesa --emoji 🤝
-    fin.ts categoria add --nome "Uber Eats" --pai Alimentação
+    fin.ts category add --name "Doações" --type expense --emoji 🤝
+    fin.ts category add --name "Uber Eats" --parent Alimentação
 
-Não crie categoria para um gasto único — use `Outros` e uma boa descrição.
-Árvore inflada é pior que categoria imprecisa.
+Do not create a category for a one-off purchase — use `Outros` and a good
+description. A bloated tree is worse than an imprecise category.

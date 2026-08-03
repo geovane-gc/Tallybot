@@ -23,8 +23,8 @@ sem IP público.
 No servidor, com Docker instalado:
 
 ```bash
-git clone git@github.com:geovane-gc/financas-bot.git
-cd financas-bot
+git clone git@github.com:geovane-gc/tallybot.git
+cd tallybot
 cp .env.example .env
 $EDITOR .env          # as mesmas três variáveis do setup local
 make up
@@ -45,11 +45,11 @@ Se você já usou o bot localmente e quer manter o histórico:
 ```bash
 # no Mac
 make backup
-scp backups/financas-*.db.gz usuario@servidor:~/
+scp backups/tally-*.db.gz usuario@servidor:~/
 
 # no servidor
-mkdir -p ~/financas-bot/data/financas
-gunzip -c ~/financas-2026*.db.gz > ~/financas-bot/data/financas/financas.db
+mkdir -p ~/tallybot/data/finance
+gunzip -c ~/tally-2026*.db.gz > ~/tallybot/data/finance/tally.db
 ```
 
 Só o banco precisa viajar. Sessões e memórias do agente podem começar do zero — a
@@ -67,7 +67,7 @@ sudo systemctl enable docker
 Se preferir amarrar o compose ao boot explicitamente:
 
 ```ini
-# /etc/systemd/system/financas-bot.service
+# /etc/systemd/system/tallybot.service
 [Unit]
 Description=Bot financeiro no Telegram
 Requires=docker.service
@@ -76,7 +76,7 @@ After=docker.service network-online.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-WorkingDirectory=/home/SEU_USUARIO/financas-bot
+WorkingDirectory=/home/SEU_USUARIO/tallybot
 ExecStart=/usr/bin/docker compose up -d
 ExecStop=/usr/bin/docker compose down
 User=SEU_USUARIO
@@ -86,7 +86,7 @@ WantedBy=multi-user.target
 ```
 
 ```bash
-sudo systemctl enable --now financas-bot
+sudo systemctl enable --now tallybot
 ```
 
 ## Backup automático
@@ -94,7 +94,7 @@ sudo systemctl enable --now financas-bot
 O banco cabe em kilobytes, então backup diário é barato. No crontab do servidor:
 
 ```cron
-0 3 * * * cd /home/SEU_USUARIO/financas-bot && ./scripts/backup.sh
+0 3 * * * cd /home/SEU_USUARIO/tallybot && ./scripts/backup.sh
 ```
 
 `backup.sh` usa `VACUUM INTO`, que produz arquivo íntegro mesmo com o container
@@ -104,7 +104,7 @@ Para tirar a cópia de casa (recomendado — backup no mesmo disco não protege
 contra perder o disco):
 
 ```cron
-30 3 * * * rclone copy /home/SEU_USUARIO/financas-bot/backups remoto:financas-bot
+30 3 * * * rclone copy /home/SEU_USUARIO/tallybot/backups remoto:tallybot
 ```
 
 ## Fly.io

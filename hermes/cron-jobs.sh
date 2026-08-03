@@ -1,93 +1,97 @@
 #!/usr/bin/env bash
 #
-# Cria os jobs agendados: relatórios periódicos, checagem de limites e
-# aplicação das despesas fixas. Idempotente.
+# Creates the scheduled jobs: periodic reports, budget checks and applying fixed
+# costs. Idempotent.
 #
 #   make cron-install
 #
-# Horários no fuso America/Sao_Paulo, definido via TZ no compose.
+# Times are America/Sao_Paulo, set through TZ in the compose file.
+#
+# The prompts themselves are Portuguese on purpose: they are instructions the
+# agent follows to produce a message for the user, and they carry the reply
+# templates.
 #
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-FIN="node /opt/data/skills/financas/scripts/fin.ts"
+FIN="node /opt/data/skills/finance/scripts/fin.ts"
 
 if [[ -z "$(docker compose ps -q hermes 2>/dev/null)" ]]; then
-  echo "O container não está rodando. Suba com 'make up' antes." >&2
+  echo "The container is not running. Start it with 'make up' first." >&2
   exit 1
 fi
 
 herm() { docker compose exec -T hermes hermes "$@"; }
 
-# `cron remove` recebe id ou nome POSICIONAL — não existe flag --name aqui.
-# `--skill financas` deixa a referência já carregada quando o job dispara,
-# poupando um turno de skill_view.
-recriar() {
-  local nome="$1"; shift
-  local agenda="$1"; shift
+# `cron remove` takes the id or the name as a POSITIONAL argument — there is no
+# --name flag here. `--skill finance` keeps the reference loaded when the job
+# fires, saving a skill_view turn.
+recreate() {
+  local name="$1"; shift
+  local schedule="$1"; shift
   local prompt="$1"; shift
 
-  herm cron remove "$nome" >/dev/null 2>&1 || true
-  herm cron create "$agenda" "$prompt" \
-    --name "$nome" --deliver telegram --skill financas "$@"
-  echo "  ✓ $nome  ($agenda)"
+  herm cron remove "$name" >/dev/null 2>&1 || true
+  herm cron create "$schedule" "$prompt" \
+    --name "$name" --deliver telegram --skill finance "$@"
+  echo "  ✓ $name  ($schedule)"
 }
 
-echo "Criando jobs agendados..."
+echo "Creating scheduled jobs..."
 
-# Às 6h, antes de qualquer relatório, para que as fixas do dia já estejam
-# lançadas quando o resumo rodar.
-recriar "financas-recorrentes" "0 6 * * *" \
+# At 06:00, before any report, so the day's fixed costs are already logged when
+# the digest runs.
+recreate "tally-recurring" "0 6 * * *" \
 "Aplique as despesas fixas vencidas rodando:
 
-  $FIN recorrente aplicar
+  $FIN recurring apply
 
 Se o campo 'silent' vier true (nada foi gerado), responda apenas [SILENT].
 Caso contrário, avise em uma linha por lançamento o que foi registrado
 automaticamente, no formato: '🔁 Lancei <descrição> de <valor> (<data>)'."
 
-recriar "financas-alertas" "0 9,15,21 * * *" \
+recreate "tally-alerts" "0 9,15,21 * * *" \
 "Verifique os limites de orçamento rodando:
 
-  $FIN alertas --marcar
+  $FIN alerts --mark
 
 Se 'silent' vier true, responda APENAS [SILENT] e mais nada.
-Se houver alertas, repasse o campo 'mensagem' de cada um, uma por linha, sem
+Se houver alertas, repasse o campo 'message' de cada um, uma por linha, sem
 acrescentar comentário, conselho ou julgamento. Só o número."
 
-recriar "financas-diario" "0 21 * * *" \
+recreate "tally-daily" "0 21 * * *" \
 "Gere o resumo do dia rodando:
 
-  $FIN relatorio --periodo hoje --top 3
+  $FIN report --period today --top 3
 
 Se o texto retornado disser que não houve lançamento no período, responda
 APENAS [SILENT] — não vale notificar para dizer que não houve gasto.
-Caso contrário, envie o campo 'texto' exatamente como veio, sem reescrever."
+Caso contrário, envie o campo 'text' exatamente como veio, sem reescrever."
 
-recriar "financas-semanal" "0 20 * * 0" \
+recreate "tally-weekly" "0 20 * * 0" \
 "Gere o fechamento da semana rodando:
 
-  $FIN relatorio --periodo semana --titulo 'Sua semana'
+  $FIN report --period week --title 'Sua semana'
 
-Envie o campo 'texto' como veio. Depois acrescente UMA frase curta comparando
+Envie o campo 'text' como veio. Depois acrescente UMA frase curta comparando
 com a semana anterior, usando o número que já está no relatório. Sem conselho e
 sem julgamento sobre os gastos."
 
-recriar "financas-mensal" "0 9 1 * *" \
+recreate "tally-monthly" "0 9 1 * *" \
 "Hoje é dia 1º: gere o fechamento do mês que terminou.
 
-  $FIN relatorio --periodo mes-passado --com-dados
+  $FIN report --period last-month --with-data
 
-Envie o campo 'texto' como veio. Em seguida, exporte os lançamentos do mês
+Envie o campo 'text' como veio. Em seguida, exporte os lançamentos do mês
 fechado para planilha:
 
-  $FIN export --periodo mes-passado --formato csv
+  $FIN export --period last-month --format csv
 
-Cite o caminho do arquivo retornado no campo 'arquivo' na sua resposta, para que
+Cite o caminho do arquivo retornado no campo 'file' na sua resposta, para que
 ele seja anexado, e termine a mensagem com [[as_document]]."
 
 echo
-echo "Jobs criados. Confira com 'make cron-list'."
-echo "Para testar um agora, sem esperar o horário:"
-echo "  docker compose exec hermes hermes cron run financas-diario"
+echo "Jobs created. Check them with 'make cron-list'."
+echo "To fire one now, without waiting for its schedule:"
+echo "  docker compose exec hermes hermes cron run tally-daily"

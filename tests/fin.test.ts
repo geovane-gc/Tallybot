@@ -1,14 +1,14 @@
 /**
- * Testes da CLI financeira.
+ * Tests for the finance CLI.
  *
- * Rodam sem credenciais, sem container e sem rede: é o que permite validar o bot
- * antes de ter chave da OpenRouter ou token do Telegram.
+ * They run with no credentials, no container and no network, which is what lets
+ * the bot be validated before there is an OpenRouter key or a Telegram token.
  *
- * O foco é onde um erro passaria despercebido e corromperia meses de dados:
- * aritmética de dinheiro, fronteiras de calendário, hierarquia de categorias no
- * orçamento e idempotência das recorrências.
+ * The focus is where a bug would corrupt months of data without showing up:
+ * cent arithmetic, calendar boundaries, category hierarchy inside budgets, and
+ * idempotency of recurring entries.
  *
- *     node --test tests/
+ *     node --test tests/fin.test.ts
  */
 
 import { describe, test } from "node:test";
@@ -20,68 +20,68 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
-  FinErro,
-  fmtBrl,
-  hoje,
-  intervaloPeriodo,
-  mesDe,
-  parseData,
-  parseValor,
-  somarDias,
-  cent,
-} from "../skills/financas/scripts/db.ts";
+  FinError,
+  addDays,
+  cents,
+  formatMoney,
+  monthOf,
+  parseAmount,
+  parseDate,
+  periodRange,
+  today,
+} from "../skills/finance/scripts/db.ts";
 
-const RAIZ = dirname(dirname(fileURLToPath(import.meta.url)));
-const FIN = join(RAIZ, "skills", "financas", "scripts", "fin.ts");
+const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
+const CLI = join(ROOT, "skills", "finance", "scripts", "fin.ts");
 
-interface Resposta {
+interface Response {
   ok: boolean;
-  erro?: string;
+  error?: string;
   _exit: number;
   [k: string]: unknown;
 }
 
 /**
- * Executa a CLI como o agente executaria — via subprocess.
+ * Runs the CLI the way the agent runs it — as a subprocess.
  *
- * Testar pelo processo, e não importando as funções, é o que garante que o
- * contrato de saída e os códigos de saída realmente funcionam.
+ * Testing through the process rather than importing the functions is what keeps
+ * the output contract and the exit codes covered too.
  */
-function run(banco: string, ...args: string[]): Resposta {
-  const proc = spawnSync(process.execPath, [FIN, "--db", banco, ...args], {
+function run(db: string, ...args: string[]): Response {
+  const proc = spawnSync(process.execPath, [CLI, "--db", db, ...args], {
     encoding: "utf8",
   });
-  assert.ok(proc.stdout, `sem saída. stderr: ${proc.stderr}`);
+  assert.ok(proc.stdout, `no output. stderr: ${proc.stderr}`);
   return { ...JSON.parse(proc.stdout), _exit: proc.status ?? -1 };
 }
 
-function ok(banco: string, ...args: string[]): Resposta {
-  const r = run(banco, ...args);
-  assert.equal(r.ok, true, `esperava sucesso, veio: ${r.erro}`);
+function ok(db: string, ...args: string[]): Response {
+  const r = run(db, ...args);
+  assert.equal(r.ok, true, `expected success, got: ${r.error}`);
   assert.equal(r._exit, 0);
   return r;
 }
 
-function erro(banco: string, ...args: string[]): string {
-  const r = run(banco, ...args);
-  assert.equal(r.ok, false, "esperava erro, veio sucesso");
+function fails(db: string, ...args: string[]): string {
+  const r = run(db, ...args);
+  assert.equal(r.ok, false, "expected a failure, got success");
   assert.equal(r._exit, 1);
-  return r.erro!;
+  return r.error!;
 }
 
-/** Banco novo e inicializado. */
-function novoBanco(): string {
-  const dir = mkdtempSync(join(tmpdir(), "fin-teste-"));
-  const caminho = join(dir, "teste.db");
-  ok(caminho, "init");
-  return caminho;
+/** A fresh, initialised database. */
+function freshDb(): string {
+  const dir = mkdtempSync(join(tmpdir(), "tally-test-"));
+  const path = join(dir, "tally.db");
+  ok(path, "init");
+  return path;
 }
 
-const lanc = (r: Resposta) => r.lancamento as Record<string, never>;
-const parcelas = (r: Resposta) => r.parcelas as Record<string, never>[];
+const tx = (r: Response) => r.transaction as Record<string, never>;
+const installments = (r: Response) => r.installments as Record<string, never>[];
 
-describe("valores", () => {
-  const casos: [unknown, number][] = [
+describe("amounts", () => {
+  const cases: [unknown, number][] = [
     [27, 2700],
     [27.5, 2750],
     ["27", 2700],
@@ -99,19 +99,19 @@ describe("valores", () => {
     ["0,99", 99],
     ["-50", 5000],
   ];
-  for (const [entrada, esperado] of casos) {
-    test(`parseValor(${JSON.stringify(entrada)}) = ${esperado}`, () => {
-      assert.equal(parseValor(entrada), esperado);
+  for (const [input, expected] of cases) {
+    test(`parseAmount(${JSON.stringify(input)}) = ${expected}`, () => {
+      assert.equal(parseAmount(input), expected);
     });
   }
 
-  for (const ruim of ["", "abc", null, undefined, 0, "0", "R$", true]) {
-    test(`recusa ${JSON.stringify(ruim)}`, () => {
-      assert.throws(() => parseValor(ruim), FinErro);
+  for (const bad of ["", "abc", null, undefined, 0, "0", "R$", true]) {
+    test(`rejects ${JSON.stringify(bad)}`, () => {
+      assert.throws(() => parseAmount(bad), FinError);
     });
   }
 
-  const formatos: [number, string][] = [
+  const formats: [number, string][] = [
     [0, "R$ 0,00"],
     [5, "R$ 0,05"],
     [2700, "R$ 27,00"],
@@ -119,717 +119,720 @@ describe("valores", () => {
     [100000000, "R$ 1.000.000,00"],
     [-2700, "-R$ 27,00"],
   ];
-  for (const [centavos, texto] of formatos) {
-    test(`fmtBrl(${centavos}) = ${texto}`, () => {
-      assert.equal(fmtBrl(cent(centavos)), texto);
+  for (const [value, text] of formats) {
+    test(`formatMoney(${value}) = ${text}`, () => {
+      assert.equal(formatMoney(cents(value)), text);
     });
   }
 
-  test("sem erro de ponto flutuante em cem somas", () => {
-    // 0,10 somado cem vezes tem que dar exatamente R$ 10,00. É o motivo de
-    // dinheiro ser inteiro: com float daria 9,999999999999998.
-    const banco = novoBanco();
+  test("no floating-point drift across a hundred additions", () => {
+    // 0.10 added a hundred times must come to exactly R$ 10,00. This is why
+    // money is an integer here: with floats it would be 9.999999999999998.
+    const db = freshDb();
     for (let i = 0; i < 100; i++) {
-      ok(banco, "add", "--valor", "0,10", "--descricao", `café ${i}`, "--categoria", "Café");
+      ok(db, "add", "--amount", "0,10", "--description", `café ${i}`, "--category", "Café");
     }
-    const r = ok(banco, "resumo", "--periodo", "mes");
-    assert.equal(r.despesas_centavos, 1000);
-    assert.equal(r.despesas_fmt, "R$ 10,00");
+    const r = ok(db, "summary", "--period", "month");
+    assert.equal(r.expenses_cents, 1000);
+    assert.equal(r.expenses_fmt, "R$ 10,00");
   });
 });
 
-describe("datas", () => {
-  test("relativas", () => {
-    assert.equal(parseData("hoje"), hoje());
-    assert.equal(parseData("ontem"), somarDias(hoje(), -1));
-    assert.equal(parseData("anteontem"), somarDias(hoje(), -2));
-    assert.equal(parseData(null), hoje());
-    assert.equal(parseData(""), hoje());
-    assert.equal(parseData(undefined), hoje());
+describe("dates", () => {
+  test("relative words, in both languages", () => {
+    assert.equal(parseDate("today"), today());
+    assert.equal(parseDate("hoje"), today());
+    assert.equal(parseDate("yesterday"), addDays(today(), -1));
+    assert.equal(parseDate("ontem"), addDays(today(), -1));
+    assert.equal(parseDate("anteontem"), addDays(today(), -2));
+    assert.equal(parseDate(null), today());
+    assert.equal(parseDate(""), today());
+    assert.equal(parseDate(undefined), today());
   });
 
-  test("formatos explícitos", () => {
-    assert.equal(parseData("2026-03-15"), "2026-03-15");
-    assert.equal(parseData("15/03/2026"), "2026-03-15");
-    assert.equal(parseData("15-03-2026"), "2026-03-15");
-    assert.equal(parseData("15/03/26"), "2026-03-15");
+  test("explicit formats are day-first", () => {
+    assert.equal(parseDate("2026-03-15"), "2026-03-15");
+    assert.equal(parseDate("15/03/2026"), "2026-03-15");
+    assert.equal(parseDate("15-03-2026"), "2026-03-15");
+    assert.equal(parseDate("15/03/26"), "2026-03-15");
   });
 
-  test("DD/MM assume o ano corrente", () => {
-    const [ano, mes] = hoje().split("-");
-    assert.equal(parseData(`01/${mes}`), `${ano}-${mes}-01`);
+  test("DD/MM assumes the current year", () => {
+    const [year, month] = today().split("-");
+    assert.equal(parseDate(`01/${month}`), `${year}-${month}-01`);
   });
 
-  test("DD/MM muito no futuro recua um ano", () => {
-    // Uma data que cairia mais de um mês à frente foi, na verdade, do ano
-    // passado — o caso de lançar "28/12" já em janeiro.
-    const futuro = somarDias(hoje(), 90);
-    const [, mes, dia] = futuro.split("-");
-    assert.ok(parseData(`${dia}/${mes}`) <= somarDias(hoje(), 31));
+  test("DD/MM far in the future falls back a year", () => {
+    // A date that would land more than a month ahead was actually last year —
+    // the case of logging "28/12" in January.
+    const future = addDays(today(), 90);
+    const [, month, day] = future.split("-");
+    assert.ok(parseDate(`${day}/${month}`) <= addDays(today(), 31));
   });
 
-  test("dia N do mês corrente", () => {
-    const [ano, mes] = hoje().split("-");
-    assert.equal(parseData("dia 1"), `${ano}-${mes}-01`);
+  test("day N of the current month", () => {
+    const [year, month] = today().split("-");
+    assert.equal(parseDate("dia 1"), `${year}-${month}-01`);
+    assert.equal(parseDate("day 1"), `${year}-${month}-01`);
   });
 
-  test("datas inexistentes são recusadas", () => {
-    assert.throws(() => parseData("31/02/2026"), FinErro);
-    assert.throws(() => parseData("2026-13-01"), FinErro);
-    assert.throws(() => parseData("2026-02-30"), FinErro);
-    assert.throws(() => parseData("qualquer coisa"), FinErro);
+  test("non-existent dates are rejected", () => {
+    assert.throws(() => parseDate("31/02/2026"), FinError);
+    assert.throws(() => parseDate("2026-13-01"), FinError);
+    assert.throws(() => parseDate("2026-02-30"), FinError);
+    assert.throws(() => parseDate("whenever"), FinError);
   });
 
-  const periodos = ["hoje", "ontem", "semana", "semana-passada", "mes", "mes-passado",
-    "mes-completo", "ano", "ano-passado", "30d", "7d", "2026-03", "tudo"];
-  for (const p of periodos) {
-    test(`período ${p}`, () => {
-      const r = intervaloPeriodo(p);
-      assert.ok(r.inicio <= r.fim, `${r.inicio} > ${r.fim}`);
-      assert.ok(r.rotulo);
+  const periods = ["today", "yesterday", "week", "last-week", "month", "last-month",
+    "full-month", "year", "last-year", "30d", "7d", "2026-03", "all"];
+  for (const p of periods) {
+    test(`period ${p}`, () => {
+      const r = periodRange(p);
+      assert.ok(r.start <= r.end, `${r.start} > ${r.end}`);
+      assert.ok(r.label);
     });
   }
 
-  test("período inválido", () => {
-    assert.throws(() => intervaloPeriodo("quinzena lunar"), FinErro);
+  test("unknown period", () => {
+    assert.throws(() => periodRange("lunar fortnight"), FinError);
   });
 
-  test("mês civil tem o último dia certo", () => {
-    const fev = intervaloPeriodo("2026-02");
-    assert.equal(fev.inicio, "2026-02-01");
-    assert.equal(fev.fim, "2026-02-28");
+  test("calendar month ends on the right day", () => {
+    const feb = periodRange("2026-02");
+    assert.equal(feb.start, "2026-02-01");
+    assert.equal(feb.end, "2026-02-28");
   });
 
-  test("ano bissexto", () => {
-    assert.equal(intervaloPeriodo("2028-02").fim, "2028-02-29");
+  test("leap year", () => {
+    assert.equal(periodRange("2028-02").end, "2028-02-29");
   });
 
-  test("semana começa na segunda", () => {
-    const r = intervaloPeriodo("semana", "2026-08-05"); // quarta
-    assert.equal(r.inicio, "2026-08-03"); // segunda
+  test("weeks start on Monday", () => {
+    const r = periodRange("week", "2026-08-05"); // a Wednesday
+    assert.equal(r.start, "2026-08-03");
   });
 
-  test("mesDe", () => {
-    assert.equal(mesDe("2026-08-03"), "2026-08");
+  test("period labels are Portuguese, since they land in report titles", () => {
+    assert.equal(periodRange("month").label, "este mês");
+    assert.equal(periodRange("last-month").label, "mês passado");
+  });
+
+  test("monthOf", () => {
+    assert.equal(monthOf("2026-08-03"), "2026-08");
   });
 });
 
-describe("lançamentos", () => {
-  test("add mínimo usa os defaults", () => {
-    const banco = novoBanco();
-    const r = ok(banco, "add", "--valor", "27", "--descricao", "Uber");
-    const l = lanc(r);
-    assert.equal(l.tipo, "despesa");
-    assert.equal(l.data, hoje());
-    assert.equal(l.conta, "Carteira");
-    assert.equal(r.id, l.id);
+describe("transactions", () => {
+  test("add with only the essentials uses the defaults", () => {
+    const db = freshDb();
+    const r = ok(db, "add", "--amount", "27", "--description", "Uber");
+    const t = tx(r);
+    assert.equal(t.type, "expense");
+    assert.equal(t.date, today());
+    assert.equal(t.account, "Carteira");
+    assert.equal(r.id, t.id);
   });
 
-  test("descrição é obrigatória", () => {
-    const banco = novoBanco();
-    assert.match(erro(banco, "add", "--valor", "10", "--descricao", "  "), /Descrição/);
+  test("description is required", () => {
+    const db = freshDb();
+    assert.match(fails(db, "add", "--amount", "10", "--description", "  "), /Descrição/);
   });
 
-  test("categoria inexistente é criada em vez de falhar", () => {
-    const banco = novoBanco();
-    const r = ok(banco, "add", "--valor", "50", "--descricao", "Curso",
-      "--categoria", "Cerâmica artesanal");
-    assert.match(String(lanc(r).categoria_completa), /Cerâmica artesanal/);
+  test("an unknown category is created instead of failing", () => {
+    const db = freshDb();
+    const r = ok(db, "add", "--amount", "50", "--description", "Curso",
+      "--category", "Cerâmica artesanal");
+    assert.match(String(tx(r).full_category), /Cerâmica artesanal/);
   });
 
-  test("categoria casa sem acento e sem caixa", () => {
-    const banco = novoBanco();
-    const r = ok(banco, "add", "--valor", "20", "--descricao", "Almoço",
-      "--categoria", "ALIMENTACAO");
-    assert.equal(lanc(r).categoria, "Alimentação");
+  test("category matching ignores accents and case", () => {
+    const db = freshDb();
+    const r = ok(db, "add", "--amount", "20", "--description", "Almoço",
+      "--category", "ALIMENTACAO");
+    assert.equal(tx(r).category, "Alimentação");
   });
 
-  test("subcategoria tem precedência sobre a raiz", () => {
-    const banco = novoBanco();
-    const r = ok(banco, "add", "--valor", "35", "--descricao", "iFood",
-      "--categoria", "Delivery");
-    assert.equal(lanc(r).categoria, "Delivery");
-    assert.equal(lanc(r).categoria_pai, "Alimentação");
+  test("a subcategory wins over its parent", () => {
+    const db = freshDb();
+    const r = ok(db, "add", "--amount", "35", "--description", "iFood",
+      "--category", "Delivery");
+    assert.equal(tx(r).category, "Delivery");
+    assert.equal(tx(r).parent_category, "Alimentação");
   });
 
-  test("conta inexistente falha com mensagem clara", () => {
-    const banco = novoBanco();
+  test("an unknown account fails with a clear message", () => {
+    const db = freshDb();
     assert.match(
-      erro(banco, "add", "--valor", "10", "--descricao", "x", "--conta", "Banco Fantasma"),
+      fails(db, "add", "--amount", "10", "--description", "x", "--account", "Banco Fantasma"),
       /não existe/,
     );
   });
 
   test("tags", () => {
-    const banco = novoBanco();
-    const r = ok(banco, "add", "--valor", "80", "--descricao", "Jantar",
-      "--categoria", "Restaurante", "--tags", "trabalho, reembolsável");
-    assert.deepEqual(lanc(r).tags, ["reembolsável", "trabalho"]);
+    const db = freshDb();
+    const r = ok(db, "add", "--amount", "80", "--description", "Jantar",
+      "--category", "Restaurante", "--tags", "trabalho, reembolsável");
+    assert.deepEqual(tx(r).tags, ["reembolsável", "trabalho"]);
   });
 
-  test("edit altera só o informado", () => {
-    const banco = novoBanco();
-    const criado = ok(banco, "add", "--valor", "27", "--descricao", "Uber",
-      "--categoria", "Uber/99");
-    const r = ok(banco, "edit", String(criado.id), "--valor", "37");
-    assert.equal(lanc(r).valor_centavos, 3700);
-    assert.equal(lanc(r).descricao, "Uber");
-    assert.equal(lanc(r).categoria, "Uber/99");
+  test("edit changes only what was passed", () => {
+    const db = freshDb();
+    const created = ok(db, "add", "--amount", "27", "--description", "Uber",
+      "--category", "Uber/99");
+    const r = ok(db, "edit", String(created.id), "--amount", "37");
+    assert.equal(tx(r).amount_cents, 3700);
+    assert.equal(tx(r).description, "Uber");
+    assert.equal(tx(r).category, "Uber/99");
   });
 
-  test("edit sem campos falha", () => {
-    const banco = novoBanco();
-    const criado = ok(banco, "add", "--valor", "10", "--descricao", "x");
-    assert.match(erro(banco, "edit", String(criado.id)), /Nada para alterar/);
+  test("edit with no fields fails", () => {
+    const db = freshDb();
+    const created = ok(db, "add", "--amount", "10", "--description", "x");
+    assert.match(fails(db, "edit", String(created.id)), /Nada para alterar/);
   });
 
-  test("edit de id inexistente", () => {
-    const banco = novoBanco();
-    assert.match(erro(banco, "edit", "999", "--valor", "10"), /#999/);
+  test("edit of an unknown id", () => {
+    const db = freshDb();
+    assert.match(fails(db, "edit", "999", "--amount", "10"), /#999/);
   });
 
   test("rm", () => {
-    const banco = novoBanco();
-    const criado = ok(banco, "add", "--valor", "10", "--descricao", "erro de digitação");
-    ok(banco, "rm", String(criado.id));
-    assert.equal(ok(banco, "ls", "--periodo", "mes").quantidade_total, 0);
+    const db = freshDb();
+    const created = ok(db, "add", "--amount", "10", "--description", "typo");
+    ok(db, "rm", String(created.id));
+    assert.equal(ok(db, "ls", "--period", "month").total_count, 0);
   });
 
-  test("transferência exige destino", () => {
-    const banco = novoBanco();
+  test("a transfer needs a destination", () => {
+    const db = freshDb();
     assert.match(
-      erro(banco, "add", "--tipo", "transferencia", "--valor", "100", "--descricao", "x"),
-      /conta-destino/,
+      fails(db, "add", "--type", "transfer", "--amount", "100", "--description", "x"),
+      /dest-account/,
     );
   });
 
-  test("transferência não conta como gasto nem receita", () => {
-    const banco = novoBanco();
-    ok(banco, "conta", "add", "--nome", "Poupança", "--tipo", "poupanca");
-    ok(banco, "add", "--tipo", "transferencia", "--valor", "500", "--descricao", "Guardar",
-      "--conta", "Carteira", "--conta-destino", "Poupança");
-    const r = ok(banco, "resumo", "--periodo", "mes");
-    assert.equal(r.despesas_centavos, 0);
-    assert.equal(r.receitas_centavos, 0);
+  test("a transfer counts as neither expense nor income", () => {
+    const db = freshDb();
+    ok(db, "account", "add", "--name", "Poupança", "--type", "savings");
+    ok(db, "add", "--type", "transfer", "--amount", "500", "--description", "Guardar",
+      "--account", "Carteira", "--dest-account", "Poupança");
+    const r = ok(db, "summary", "--period", "month");
+    assert.equal(r.expenses_cents, 0);
+    assert.equal(r.income_cents, 0);
   });
 
-  test("transferência move o saldo entre as contas", () => {
-    const banco = novoBanco();
-    ok(banco, "conta", "add", "--nome", "Poupança", "--tipo", "poupanca");
-    ok(banco, "add", "--tipo", "receita", "--valor", "1000", "--descricao", "Entrada",
-      "--conta", "Carteira", "--categoria", "Salário");
-    ok(banco, "add", "--tipo", "transferencia", "--valor", "400", "--descricao", "Guardar",
-      "--conta", "Carteira", "--conta-destino", "Poupança");
-    const contas = ok(banco, "saldo").contas as { nome: string; saldo_centavos: number }[];
-    const saldo = Object.fromEntries(contas.map((c) => [c.nome, c.saldo_centavos]));
-    assert.equal(saldo["Carteira"], 60000);
-    assert.equal(saldo["Poupança"], 40000);
+  test("a transfer moves the balance between accounts", () => {
+    const db = freshDb();
+    ok(db, "account", "add", "--name", "Poupança", "--type", "savings");
+    ok(db, "add", "--type", "income", "--amount", "1000", "--description", "Entrada",
+      "--account", "Carteira", "--category", "Salário");
+    ok(db, "add", "--type", "transfer", "--amount", "400", "--description", "Guardar",
+      "--account", "Carteira", "--dest-account", "Poupança");
+    const rows = ok(db, "balance").accounts as { name: string; balance_cents: number }[];
+    const balances = Object.fromEntries(rows.map((c) => [c.name, c.balance_cents]));
+    assert.equal(balances["Carteira"], 60000);
+    assert.equal(balances["Poupança"], 40000);
   });
 
-  test("transferência para a mesma conta falha", () => {
-    const banco = novoBanco();
+  test("a transfer to the same account fails", () => {
+    const db = freshDb();
     assert.match(
-      erro(banco, "add", "--tipo", "transferencia", "--valor", "10", "--descricao", "x",
-        "--conta", "Carteira", "--conta-destino", "Carteira"),
+      fails(db, "add", "--type", "transfer", "--amount", "10", "--description", "x",
+        "--account", "Carteira", "--dest-account", "Carteira"),
       /mesma/,
     );
   });
 
-  test("tipo inválido é recusado", () => {
-    const banco = novoBanco();
+  test("an invalid type is rejected", () => {
+    const db = freshDb();
     assert.match(
-      erro(banco, "add", "--valor", "10", "--descricao", "x", "--tipo", "saque"),
+      fails(db, "add", "--amount", "10", "--description", "x", "--type", "withdrawal"),
       /Tipo inválido/,
     );
   });
 
-  test("opção desconhecida devolve as aceitas", () => {
-    const banco = novoBanco();
-    const msg = erro(banco, "add", "--valor", "10", "--descricao", "x", "--moeda", "USD");
-    assert.match(msg, /--categoria/);
+  test("an unknown option reports the accepted ones", () => {
+    const db = freshDb();
+    const message = fails(db, "add", "--amount", "10", "--description", "x", "--currency", "USD");
+    assert.match(message, /--category/);
   });
 });
 
-describe("parcelas", () => {
-  test("divide em meses seguidos", () => {
-    const banco = novoBanco();
-    const r = ok(banco, "add", "--valor", "1200", "--descricao", "Notebook",
-      "--categoria", "Eletrônicos", "--parcelas", "3", "--data", "2026-01-15");
-    assert.deepEqual(parcelas(r).map((p) => p.data),
+describe("instalments", () => {
+  test("spread over consecutive months", () => {
+    const db = freshDb();
+    const r = ok(db, "add", "--amount", "1200", "--description", "Notebook",
+      "--category", "Eletrônicos", "--installments", "3", "--date", "2026-01-15");
+    assert.deepEqual(installments(r).map((p) => p.date),
       ["2026-01-15", "2026-02-15", "2026-03-15"]);
-    assert.ok(parcelas(r).every((p) => p.valor_centavos === 40000));
+    assert.ok(installments(r).every((p) => p.amount_cents === 40000));
   });
 
-  test("não perde centavo na divisão", () => {
-    // R$ 100,00 em 3x = 33,34 + 33,33 + 33,33. A soma tem que fechar.
-    const banco = novoBanco();
-    const r = ok(banco, "add", "--valor", "100", "--descricao", "Curso",
-      "--categoria", "Curso", "--parcelas", "3");
-    const valores = parcelas(r).map((p) => Number(p.valor_centavos));
-    assert.equal(valores.reduce((a, b) => a + b, 0), 10000);
-    assert.deepEqual(valores, [3334, 3333, 3333]);
+  test("no cent is lost when splitting", () => {
+    // R$ 100,00 in 3x is 33.34 + 33.33 + 33.33. The sum has to add up.
+    const db = freshDb();
+    const r = ok(db, "add", "--amount", "100", "--description", "Curso",
+      "--category", "Curso", "--installments", "3");
+    const values = installments(r).map((p) => Number(p.amount_cents));
+    assert.equal(values.reduce((a, b) => a + b, 0), 10000);
+    assert.deepEqual(values, [3334, 3333, 3333]);
   });
 
-  test("ajusta dia inexistente no mês seguinte", () => {
-    // 31/01 + 1 mês = 28/02, não uma data inválida.
-    const banco = novoBanco();
-    const r = ok(banco, "add", "--valor", "300", "--descricao", "Parcelado",
-      "--categoria", "Compras", "--parcelas", "3", "--data", "2026-01-31");
-    assert.deepEqual(parcelas(r).map((p) => p.data),
+  test("a day that does not exist next month is clamped", () => {
+    // Jan 31 + 1 month = Feb 28, not an invalid date.
+    const db = freshDb();
+    const r = ok(db, "add", "--amount", "300", "--description", "Parcelado",
+      "--category", "Compras", "--installments", "3", "--date", "2026-01-31");
+    assert.deepEqual(installments(r).map((p) => p.date),
       ["2026-01-31", "2026-02-28", "2026-03-31"]);
   });
 
-  test("rm --grupo apaga a série inteira", () => {
-    const banco = novoBanco();
-    const r = ok(banco, "add", "--valor", "900", "--descricao", "TV",
-      "--categoria", "Eletrônicos", "--parcelas", "3");
-    assert.equal(ok(banco, "rm", String(parcelas(r)[0].id), "--grupo").quantidade, 3);
+  test("rm --group deletes the whole series", () => {
+    const db = freshDb();
+    const r = ok(db, "add", "--amount", "900", "--description", "TV",
+      "--category", "Eletrônicos", "--installments", "3");
+    assert.equal(ok(db, "rm", String(installments(r)[0].id), "--group").count, 3);
   });
 
-  test("rm sem --grupo apaga só uma parcela", () => {
-    const banco = novoBanco();
-    const r = ok(banco, "add", "--valor", "900", "--descricao", "TV",
-      "--categoria", "Eletrônicos", "--parcelas", "3");
-    assert.equal(ok(banco, "rm", String(parcelas(r)[0].id)).quantidade, 1);
+  test("rm without --group deletes only one instalment", () => {
+    const db = freshDb();
+    const r = ok(db, "add", "--amount", "900", "--description", "TV",
+      "--category", "Eletrônicos", "--installments", "3");
+    assert.equal(ok(db, "rm", String(installments(r)[0].id)).count, 1);
   });
 
-  test("parcelas fora do limite", () => {
-    const banco = novoBanco();
+  test("instalment count out of range", () => {
+    const db = freshDb();
     assert.match(
-      erro(banco, "add", "--valor", "10", "--descricao", "x", "--parcelas", "200"),
+      fails(db, "add", "--amount", "10", "--description", "x", "--installments", "200"),
       /parcelas/,
     );
   });
 });
 
-describe("orçamentos", () => {
-  test("gasto em subcategoria conta no orçamento do pai", () => {
-    // Limite de "Alimentação" tem que capturar o que foi lançado em "Delivery",
-    // senão o teto da raiz nunca fecha com a soma das partes.
-    const banco = novoBanco();
-    ok(banco, "orcamento", "set", "--categoria", "Alimentação", "--limite", "500");
-    ok(banco, "add", "--valor", "120", "--descricao", "iFood", "--categoria", "Delivery");
-    ok(banco, "add", "--valor", "80", "--descricao", "Mercado", "--categoria", "Mercado");
-    const s = (ok(banco, "orcamento", "status").orcamentos as never[])[0] as never as
-      { gasto_centavos: number; percentual: number };
-    assert.equal(s.gasto_centavos, 20000);
-    assert.equal(s.percentual, 40);
+describe("budgets", () => {
+  test("spending in a subcategory counts against the parent's budget", () => {
+    // A limit on "Alimentação" has to capture what was logged under "Delivery",
+    // or the parent's cap would never add up to the sum of its parts.
+    const db = freshDb();
+    ok(db, "budget", "set", "--category", "Alimentação", "--limit", "500");
+    ok(db, "add", "--amount", "120", "--description", "iFood", "--category", "Delivery");
+    ok(db, "add", "--amount", "80", "--description", "Mercado", "--category", "Mercado");
+    const b = (ok(db, "budget", "status").budgets as
+      { spent_cents: number; pct: number }[])[0];
+    assert.equal(b.spent_cents, 20000);
+    assert.equal(b.pct, 40);
   });
 
-  test("teto global soma tudo", () => {
-    const banco = novoBanco();
-    ok(banco, "orcamento", "set", "--limite", "1000");
-    ok(banco, "add", "--valor", "300", "--descricao", "a", "--categoria", "Mercado");
-    ok(banco, "add", "--valor", "200", "--descricao", "b", "--categoria", "Uber/99");
-    const s = (ok(banco, "orcamento", "status").orcamentos as never[])[0] as never as
-      { categoria: string; gasto_centavos: number };
-    assert.equal(s.categoria, "Total do mês");
-    assert.equal(s.gasto_centavos, 50000);
+  test("the global cap sums everything", () => {
+    const db = freshDb();
+    ok(db, "budget", "set", "--limit", "1000");
+    ok(db, "add", "--amount", "300", "--description", "a", "--category", "Mercado");
+    ok(db, "add", "--amount", "200", "--description", "b", "--category", "Uber/99");
+    const b = (ok(db, "budget", "status").budgets as
+      { category: string; spent_cents: number }[])[0];
+    assert.equal(b.category, "Total do mês");
+    assert.equal(b.spent_cents, 50000);
   });
 
-  test("set repetido não duplica", () => {
-    // O UNIQUE do SQLite não pega NULL, então isso já foi bug uma vez.
-    const banco = novoBanco();
-    for (const limite of ["1000", "2000", "3000"]) {
-      ok(banco, "orcamento", "set", "--limite", limite);
+  test("setting twice does not duplicate", () => {
+    // SQLite's UNIQUE does not catch NULL, so this was a real bug once.
+    const db = freshDb();
+    for (const limit of ["1000", "2000", "3000"]) {
+      ok(db, "budget", "set", "--limit", limit);
     }
-    const r = ok(banco, "orcamento", "status");
-    const lista = r.orcamentos as { limite_centavos: number }[];
-    assert.equal(lista.length, 1);
-    assert.equal(lista[0].limite_centavos, 300000);
+    const list = ok(db, "budget", "status").budgets as { limit_cents: number }[];
+    assert.equal(list.length, 1);
+    assert.equal(list[0].limit_cents, 300000);
   });
 
-  test("orçamento do mês tem precedência sobre o recorrente", () => {
-    const banco = novoBanco();
-    ok(banco, "orcamento", "set", "--categoria", "Lazer", "--limite", "200");
-    ok(banco, "orcamento", "set", "--categoria", "Lazer", "--limite", "800",
-      "--mes", mesDe(hoje()));
-    const s = (ok(banco, "orcamento", "status").orcamentos as
-      { limite_centavos: number; especifico_do_mes: boolean }[])[0];
-    assert.equal(s.limite_centavos, 80000);
-    assert.equal(s.especifico_do_mes, true);
+  test("a month-specific budget wins over the recurring one", () => {
+    const db = freshDb();
+    ok(db, "budget", "set", "--category", "Lazer", "--limit", "200");
+    ok(db, "budget", "set", "--category", "Lazer", "--limit", "800", "--month", monthOf(today()));
+    const b = (ok(db, "budget", "status").budgets as
+      { limit_cents: number; month_specific: boolean }[])[0];
+    assert.equal(b.limit_cents, 80000);
+    assert.equal(b.month_specific, true);
   });
 
-  test("situações ok / atenção / estourado", () => {
-    const banco = novoBanco();
-    const situacao = () =>
-      (ok(banco, "orcamento", "status").orcamentos as { situacao: string }[])[0].situacao;
+  test("statuses: ok / warning / over", () => {
+    const db = freshDb();
+    const status = () =>
+      (ok(db, "budget", "status").budgets as { status: string }[])[0].status;
 
-    ok(banco, "orcamento", "set", "--categoria", "Lazer", "--limite", "100",
-      "--alerta", "80");
-    ok(banco, "add", "--valor", "50", "--descricao", "Bar", "--categoria", "Bar");
-    assert.equal(situacao(), "ok");
-    ok(banco, "add", "--valor", "35", "--descricao", "Cinema", "--categoria", "Cinema");
-    assert.equal(situacao(), "atencao");
-    ok(banco, "add", "--valor", "30", "--descricao", "Show", "--categoria", "Eventos");
-    assert.equal(situacao(), "estourado");
+    ok(db, "budget", "set", "--category", "Lazer", "--limit", "100", "--alert", "80");
+    ok(db, "add", "--amount", "50", "--description", "Bar", "--category", "Bar");
+    assert.equal(status(), "ok");
+    ok(db, "add", "--amount", "35", "--description", "Cinema", "--category", "Cinema");
+    assert.equal(status(), "warning");
+    ok(db, "add", "--amount", "30", "--description", "Show", "--category", "Eventos");
+    assert.equal(status(), "over");
   });
 
-  test("add devolve o orçamento afetado", () => {
-    // O agente avisa na mesma resposta, sem uma segunda chamada.
-    const banco = novoBanco();
-    ok(banco, "orcamento", "set", "--categoria", "Alimentação", "--limite", "100");
-    const r = ok(banco, "add", "--valor", "95", "--descricao", "Mercado",
-      "--categoria", "Mercado");
-    const o = r.orcamento as { situacao: string; percentual: number };
-    assert.equal(o.situacao, "atencao");
-    assert.equal(o.percentual, 95);
+  test("add returns the budget it affected", () => {
+    // So the agent can warn in the same reply, with no second call.
+    const db = freshDb();
+    ok(db, "budget", "set", "--category", "Alimentação", "--limit", "100");
+    const r = ok(db, "add", "--amount", "95", "--description", "Mercado", "--category", "Mercado");
+    const b = r.budget as { status: string; pct: number };
+    assert.equal(b.status, "warning");
+    assert.equal(b.pct, 95);
   });
 
-  test("rm orçamento", () => {
-    const banco = novoBanco();
-    ok(banco, "orcamento", "set", "--categoria", "Lazer", "--limite", "100");
-    ok(banco, "orcamento", "rm", "--categoria", "Lazer");
-    assert.equal(ok(banco, "orcamento", "status").quantidade, 0);
+  test("rm budget", () => {
+    const db = freshDb();
+    ok(db, "budget", "set", "--category", "Lazer", "--limit", "100");
+    ok(db, "budget", "rm", "--category", "Lazer");
+    assert.equal(ok(db, "budget", "status").count, 0);
   });
 
-  test("mês inválido", () => {
-    const banco = novoBanco();
+  test("invalid month", () => {
+    const db = freshDb();
     assert.match(
-      erro(banco, "orcamento", "set", "--limite", "100", "--mes", "agosto"),
+      fails(db, "budget", "set", "--limit", "100", "--month", "agosto"),
       /Mês inválido/,
     );
   });
 });
 
-describe("alertas", () => {
-  test("silencia quando está tudo bem", () => {
-    const banco = novoBanco();
-    ok(banco, "orcamento", "set", "--categoria", "Lazer", "--limite", "1000");
-    ok(banco, "add", "--valor", "10", "--descricao", "Bar", "--categoria", "Bar");
-    const r = ok(banco, "alertas");
+describe("alerts", () => {
+  test("stays silent when everything is fine", () => {
+    const db = freshDb();
+    ok(db, "budget", "set", "--category", "Lazer", "--limit", "1000");
+    ok(db, "add", "--amount", "10", "--description", "Bar", "--category", "Bar");
+    const r = ok(db, "alerts");
     assert.equal(r.silent, true);
-    assert.deepEqual(r.alertas, []);
+    assert.deepEqual(r.alerts, []);
   });
 
-  test("não repete o mesmo alerta no mesmo mês", () => {
-    const banco = novoBanco();
-    ok(banco, "orcamento", "set", "--categoria", "Lazer", "--limite", "100");
-    ok(banco, "add", "--valor", "150", "--descricao", "Show", "--categoria", "Eventos");
+  test("does not repeat the same alert within a month", () => {
+    const db = freshDb();
+    ok(db, "budget", "set", "--category", "Lazer", "--limit", "100");
+    ok(db, "add", "--amount", "150", "--description", "Show", "--category", "Eventos");
 
-    const primeiro = ok(banco, "alertas", "--marcar");
-    assert.equal(primeiro.quantidade, 1);
-    assert.equal((primeiro.alertas as { nivel: string }[])[0].nivel, "estourado");
+    const first = ok(db, "alerts", "--mark");
+    assert.equal(first.count, 1);
+    assert.equal((first.alerts as { level: string }[])[0].level, "over");
 
-    assert.equal(ok(banco, "alertas").silent, true);
-    assert.equal(ok(banco, "alertas", "--repetir").quantidade, 1);
+    assert.equal(ok(db, "alerts").silent, true);
+    assert.equal(ok(db, "alerts", "--repeat").count, 1);
   });
 
-  test("subir de atenção para estourado é alerta novo", () => {
-    const banco = novoBanco();
-    ok(banco, "orcamento", "set", "--categoria", "Lazer", "--limite", "100",
-      "--alerta", "70");
-    ok(banco, "add", "--valor", "75", "--descricao", "Bar", "--categoria", "Bar");
-    assert.equal(
-      (ok(banco, "alertas", "--marcar").alertas as { nivel: string }[])[0].nivel,
-      "atencao",
-    );
+  test("going from warning to over is a new alert", () => {
+    const db = freshDb();
+    ok(db, "budget", "set", "--category", "Lazer", "--limit", "100", "--alert", "70");
+    ok(db, "add", "--amount", "75", "--description", "Bar", "--category", "Bar");
+    assert.equal((ok(db, "alerts", "--mark").alerts as { level: string }[])[0].level, "warning");
 
-    ok(banco, "add", "--valor", "40", "--descricao", "Show", "--categoria", "Eventos");
-    const r = ok(banco, "alertas", "--marcar");
-    assert.equal(r.quantidade, 1);
-    assert.equal((r.alertas as { nivel: string }[])[0].nivel, "estourado");
+    ok(db, "add", "--amount", "40", "--description", "Show", "--category", "Eventos");
+    const r = ok(db, "alerts", "--mark");
+    assert.equal(r.count, 1);
+    assert.equal((r.alerts as { level: string }[])[0].level, "over");
+  });
+
+  test("alert messages are Portuguese, since the agent forwards them", () => {
+    const db = freshDb();
+    ok(db, "budget", "set", "--category", "Lazer", "--limit", "100");
+    ok(db, "add", "--amount", "150", "--description", "Show", "--category", "Eventos");
+    const message = (ok(db, "alerts").alerts as { message: string }[])[0].message;
+    assert.match(message, /estourou o limite do mês/);
   });
 });
 
-describe("relatórios", () => {
-  test("resumo agrupa na categoria raiz", () => {
-    const banco = novoBanco();
-    ok(banco, "add", "--valor", "100", "--descricao", "iFood", "--categoria", "Delivery");
-    ok(banco, "add", "--valor", "50", "--descricao", "Mercado", "--categoria", "Mercado");
-    ok(banco, "add", "--valor", "30", "--descricao", "Uber", "--categoria", "Uber/99");
-    const r = ok(banco, "resumo", "--periodo", "mes");
-    const porCat = Object.fromEntries(
-      (r.por_categoria as { categoria: string; total_centavos: number }[]).map((c) => [
-        c.categoria,
-        c.total_centavos,
+describe("reports", () => {
+  test("summary rolls up to the root category", () => {
+    const db = freshDb();
+    ok(db, "add", "--amount", "100", "--description", "iFood", "--category", "Delivery");
+    ok(db, "add", "--amount", "50", "--description", "Mercado", "--category", "Mercado");
+    ok(db, "add", "--amount", "30", "--description", "Uber", "--category", "Uber/99");
+    const r = ok(db, "summary", "--period", "month");
+    const byCategory = Object.fromEntries(
+      (r.by_category as { category: string; total_cents: number }[]).map((c) => [
+        c.category,
+        c.total_cents,
       ]),
     );
-    assert.deepEqual(porCat, { "Alimentação": 15000, Transporte: 3000 });
+    assert.deepEqual(byCategory, { "Alimentação": 15000, Transporte: 3000 });
   });
 
-  test("percentuais somam cem", () => {
-    const banco = novoBanco();
-    for (const [valor, cat] of [["100", "Mercado"], ["200", "Uber/99"], ["300", "Bar"]]) {
-      ok(banco, "add", "--valor", valor, "--descricao", "x", "--categoria", cat);
+  test("percentages add up to a hundred", () => {
+    const db = freshDb();
+    for (const [amount, category] of [["100", "Mercado"], ["200", "Uber/99"], ["300", "Bar"]]) {
+      ok(db, "add", "--amount", amount, "--description", "x", "--category", category);
     }
-    const r = ok(banco, "resumo", "--periodo", "mes");
-    const total = (r.por_categoria as { percentual: number }[]).reduce(
-      (a, c) => a + c.percentual, 0);
+    const r = ok(db, "summary", "--period", "month");
+    const total = (r.by_category as { pct: number }[]).reduce((a, c) => a + c.pct, 0);
     assert.equal(Math.round(total), 100);
   });
 
-  test("comparação de mês civil usa o mês civil anterior", () => {
-    const banco = novoBanco();
-    ok(banco, "add", "--valor", "100", "--descricao", "jan", "--categoria", "Mercado",
-      "--data", "2026-01-10");
-    ok(banco, "add", "--valor", "200", "--descricao", "fev", "--categoria", "Mercado",
-      "--data", "2026-02-10");
-    const r = ok(banco, "resumo", "--periodo", "2026-02");
-    assert.equal(r.despesas_centavos, 20000);
-    const c = r.comparacao as { despesas_anterior_fmt: string; variacao_pct: number };
-    assert.equal(c.despesas_anterior_fmt, "R$ 100,00");
-    assert.equal(c.variacao_pct, 100);
+  test("a calendar month compares against the previous calendar month", () => {
+    const db = freshDb();
+    ok(db, "add", "--amount", "100", "--description", "jan", "--category", "Mercado",
+      "--date", "2026-01-10");
+    ok(db, "add", "--amount", "200", "--description", "fev", "--category", "Mercado",
+      "--date", "2026-02-10");
+    const r = ok(db, "summary", "--period", "2026-02");
+    assert.equal(r.expenses_cents, 20000);
+    const c = r.comparison as { previous_expenses_fmt: string; change_pct: number };
+    assert.equal(c.previous_expenses_fmt, "R$ 100,00");
+    assert.equal(c.change_pct, 100);
   });
 
-  test("relatório gera texto para o Telegram", () => {
-    const banco = novoBanco();
-    ok(banco, "add", "--valor", "100", "--descricao", "Mercado", "--categoria", "Mercado");
-    const texto = ok(banco, "relatorio", "--periodo", "mes").texto as string;
-    assert.match(texto, /Gastos/);
-    assert.match(texto, /R\$ 100,00/);
-    // Sem tabela markdown: o Telegram não renderiza.
-    assert.doesNotMatch(texto, /\|---/);
+  test("report produces Portuguese text for Telegram", () => {
+    const db = freshDb();
+    ok(db, "add", "--amount", "100", "--description", "Mercado", "--category", "Mercado");
+    const text = ok(db, "report", "--period", "month").text as string;
+    assert.match(text, /Gastos/);
+    assert.match(text, /R\$ 100,00/);
+    // No markdown table: Telegram does not render them.
+    assert.doesNotMatch(text, /\|---/);
   });
 
-  test("relatório de período vazio não quebra", () => {
-    const banco = novoBanco();
-    const texto = ok(banco, "relatorio", "--periodo", "2020-01").texto as string;
-    assert.match(texto, /Nenhum lançamento/);
+  test("a report over an empty period does not break", () => {
+    const db = freshDb();
+    const text = ok(db, "report", "--period", "2020-01").text as string;
+    assert.match(text, /Nenhum lançamento/);
   });
 
-  test("média diária", () => {
-    const banco = novoBanco();
-    ok(banco, "add", "--valor", "310", "--descricao", "x", "--categoria", "Mercado",
-      "--data", "2026-01-15");
-    const r = ok(banco, "resumo", "--periodo", "2026-01");
-    assert.equal(r.dias, 31);
-    assert.equal(r.media_diaria_fmt, "R$ 10,00");
-  });
-});
-
-describe("recorrentes", () => {
-  test("aplicar é idempotente", () => {
-    // Rodar duas vezes no mesmo dia não pode duplicar o aluguel.
-    const banco = novoBanco();
-    const ontem = somarDias(hoje(), -1);
-    ok(banco, "recorrente", "add", "--descricao", "Aluguel", "--valor", "1500",
-      "--categoria", "Aluguel", "--dia", ontem.slice(8));
-
-    const primeiro = ok(banco, "recorrente", "aplicar");
-    const segundo = ok(banco, "recorrente", "aplicar");
-    assert.equal(segundo.quantidade, 0);
-    assert.equal(segundo.silent, true);
-    assert.equal(ok(banco, "ls", "--periodo", "tudo").quantidade_total, primeiro.quantidade);
-  });
-
-  test("cadastrar não lança retroativo", () => {
-    // Cadastrar hoje uma recorrência do dia 1 não deve inventar a cobrança deste
-    // mês — ela provavelmente já foi lançada à mão.
-    const banco = novoBanco();
-    if (Number(hoje().slice(8)) <= 1) return;
-    const r = ok(banco, "recorrente", "add", "--descricao", "Aluguel", "--valor", "1500",
-      "--categoria", "Aluguel", "--dia", "1");
-    assert.ok(String(r.proxima_data) > hoje());
-    assert.equal(ok(banco, "recorrente", "aplicar").quantidade, 0);
-  });
-
-  test("total mensal fixo", () => {
-    const banco = novoBanco();
-    ok(banco, "recorrente", "add", "--descricao", "Netflix", "--valor", "44,90",
-      "--categoria", "Streaming", "--dia", "5");
-    ok(banco, "recorrente", "add", "--descricao", "Aluguel", "--valor", "1500",
-      "--categoria", "Aluguel", "--dia", "10");
-    assert.equal(ok(banco, "recorrente", "list").total_mensal_fixo_fmt, "R$ 1.544,90");
-  });
-
-  test("desativar", () => {
-    const banco = novoBanco();
-    const r = ok(banco, "recorrente", "add", "--descricao", "Spotify", "--valor", "22",
-      "--categoria", "Streaming", "--dia", "3");
-    ok(banco, "recorrente", "rm", "--id", String(r.id));
-    assert.equal(ok(banco, "recorrente", "list").quantidade, 0);
+  test("daily average", () => {
+    const db = freshDb();
+    ok(db, "add", "--amount", "310", "--description", "x", "--category", "Mercado",
+      "--date", "2026-01-15");
+    const r = ok(db, "summary", "--period", "2026-01");
+    assert.equal(r.days, 31);
+    assert.equal(r.daily_average_fmt, "R$ 10,00");
   });
 });
 
-describe("metas", () => {
-  test("progresso e aporte necessário", () => {
-    const banco = novoBanco();
-    ok(banco, "meta", "add", "--nome", "Viagem", "--alvo", "15000", "--inicial", "3000",
-      "--prazo", somarDias(hoje(), 300));
-    const meta = (ok(banco, "meta", "aportar", "--nome", "viagem", "--valor", "1000")
-      .metas as Record<string, unknown>[])[0];
-    assert.equal(meta.atual_fmt, "R$ 4.000,00");
-    assert.equal(meta.percentual, 26.7);
-    assert.equal(meta.falta_fmt, "R$ 11.000,00");
-    assert.ok(meta.aporte_mensal_necessario_fmt);
+describe("recurring", () => {
+  test("apply is idempotent", () => {
+    // Running twice in the same day must not duplicate the rent.
+    const db = freshDb();
+    const yesterday = addDays(today(), -1);
+    ok(db, "recurring", "add", "--description", "Aluguel", "--amount", "1500",
+      "--category", "Aluguel", "--day", yesterday.slice(8));
+
+    const first = ok(db, "recurring", "apply");
+    const second = ok(db, "recurring", "apply");
+    assert.equal(second.count, 0);
+    assert.equal(second.silent, true);
+    assert.equal(ok(db, "ls", "--period", "all").total_count, first.count);
   });
 
-  test("conclusão", () => {
-    const banco = novoBanco();
-    ok(banco, "meta", "add", "--nome", "Reserva", "--alvo", "1000");
-    const meta = (ok(banco, "meta", "aportar", "--nome", "Reserva", "--valor", "1000")
-      .metas as { concluida: boolean }[])[0];
-    assert.equal(meta.concluida, true);
+  test("adding one does not backfill the current period", () => {
+    // Registering a day-1 entry today must not invent this month's charge — it
+    // was most likely already logged by hand.
+    const db = freshDb();
+    if (Number(today().slice(8)) <= 1) return;
+    const r = ok(db, "recurring", "add", "--description", "Aluguel", "--amount", "1500",
+      "--category", "Aluguel", "--day", "1");
+    assert.ok(String(r.next_date) > today());
+    assert.equal(ok(db, "recurring", "apply").count, 0);
   });
 
-  test("nome duplicado", () => {
-    const banco = novoBanco();
-    ok(banco, "meta", "add", "--nome", "Reserva", "--alvo", "1000");
-    assert.match(erro(banco, "meta", "add", "--nome", "Reserva", "--alvo", "2000"),
-      /Já existe/);
+  test("monthly fixed total", () => {
+    const db = freshDb();
+    ok(db, "recurring", "add", "--description", "Netflix", "--amount", "44,90",
+      "--category", "Streaming", "--day", "5");
+    ok(db, "recurring", "add", "--description", "Aluguel", "--amount", "1500",
+      "--category", "Aluguel", "--day", "10");
+    assert.equal(ok(db, "recurring", "list").monthly_fixed_total_fmt, "R$ 1.544,90");
   });
 
-  test("aporte em meta inexistente", () => {
-    const banco = novoBanco();
-    assert.match(erro(banco, "meta", "aportar", "--nome", "Fantasma", "--valor", "10"),
+  test("deactivate", () => {
+    const db = freshDb();
+    const r = ok(db, "recurring", "add", "--description", "Spotify", "--amount", "22",
+      "--category", "Streaming", "--day", "3");
+    ok(db, "recurring", "rm", "--id", String(r.id));
+    assert.equal(ok(db, "recurring", "list").count, 0);
+  });
+});
+
+describe("goals", () => {
+  test("progress and the monthly deposit needed", () => {
+    const db = freshDb();
+    ok(db, "goal", "add", "--name", "Viagem", "--target", "15000", "--initial", "3000",
+      "--deadline", addDays(today(), 300));
+    const goal = (ok(db, "goal", "deposit", "--name", "viagem", "--amount", "1000")
+      .goals as Record<string, unknown>[])[0];
+    assert.equal(goal.saved_fmt, "R$ 4.000,00");
+    assert.equal(goal.pct, 26.7);
+    assert.equal(goal.missing_fmt, "R$ 11.000,00");
+    assert.ok(goal.monthly_needed_fmt);
+  });
+
+  test("completion", () => {
+    const db = freshDb();
+    ok(db, "goal", "add", "--name", "Reserva", "--target", "1000");
+    const goal = (ok(db, "goal", "deposit", "--name", "Reserva", "--amount", "1000")
+      .goals as { done: boolean }[])[0];
+    assert.equal(goal.done, true);
+  });
+
+  test("duplicate name", () => {
+    const db = freshDb();
+    ok(db, "goal", "add", "--name", "Reserva", "--target", "1000");
+    assert.match(fails(db, "goal", "add", "--name", "Reserva", "--target", "2000"), /Já existe/);
+  });
+
+  test("deposit into an unknown goal", () => {
+    const db = freshDb();
+    assert.match(fails(db, "goal", "deposit", "--name", "Fantasma", "--amount", "10"),
       /Não achei/);
   });
 });
 
-describe("contas", () => {
-  test("cartão mostra fatura do mês e limite usado", () => {
-    const banco = novoBanco();
-    ok(banco, "conta", "add", "--nome", "Nubank", "--tipo", "cartao",
-      "--vencimento", "10", "--limite", "5000");
-    ok(banco, "add", "--valor", "300", "--descricao", "Compra", "--categoria", "Compras",
-      "--conta", "Nubank");
-    const cartao = (ok(banco, "saldo").contas as Record<string, unknown>[])
-      .find((c) => c.nome === "Nubank")!;
-    assert.equal(cartao.fatura_mes_fmt, "R$ 300,00");
-    assert.equal(cartao.limite_usado_pct, 6);
-    // Negativo = você deve.
-    assert.equal(cartao.saldo_centavos, -30000);
+describe("accounts", () => {
+  test("a card shows the month's bill and limit usage", () => {
+    const db = freshDb();
+    ok(db, "account", "add", "--name", "Nubank", "--type", "card",
+      "--due", "10", "--limit", "5000");
+    ok(db, "add", "--amount", "300", "--description", "Compra", "--category", "Compras",
+      "--account", "Nubank");
+    const card = (ok(db, "balance").accounts as Record<string, unknown>[])
+      .find((c) => c.name === "Nubank")!;
+    assert.equal(card.month_bill_fmt, "R$ 300,00");
+    assert.equal(card.limit_used_pct, 6);
+    // Negative means you owe.
+    assert.equal(card.balance_cents, -30000);
   });
 
-  test("saldo inicial", () => {
-    const banco = novoBanco();
-    ok(banco, "conta", "add", "--nome", "Itaú", "--saldo-inicial", "1000");
-    const conta = (ok(banco, "saldo").contas as Record<string, unknown>[])
-      .find((c) => c.nome === "Itaú")!;
-    assert.equal(conta.saldo_centavos, 100000);
+  test("opening balance", () => {
+    const db = freshDb();
+    ok(db, "account", "add", "--name", "Itaú", "--opening-balance", "1000");
+    const account = (ok(db, "balance").accounts as Record<string, unknown>[])
+      .find((c) => c.name === "Itaú")!;
+    assert.equal(account.balance_cents, 100000);
   });
 
-  test("nome duplicado", () => {
-    const banco = novoBanco();
-    ok(banco, "conta", "add", "--nome", "Itaú");
-    assert.match(erro(banco, "conta", "add", "--nome", "Itaú"), /Já existe/);
+  test("duplicate name", () => {
+    const db = freshDb();
+    ok(db, "account", "add", "--name", "Itaú");
+    assert.match(fails(db, "account", "add", "--name", "Itaú"), /Já existe/);
   });
 
-  test("desativar preserva o histórico", () => {
-    const banco = novoBanco();
-    ok(banco, "conta", "add", "--nome", "Antiga");
-    ok(banco, "add", "--valor", "50", "--descricao", "x", "--categoria", "Mercado",
-      "--conta", "Antiga");
-    const r = ok(banco, "conta", "rm", "--nome", "Antiga");
-    assert.equal(r.lancamentos_preservados, 1);
-    assert.equal(ok(banco, "ls", "--periodo", "mes").quantidade_total, 1);
+  test("deactivating keeps the history", () => {
+    const db = freshDb();
+    ok(db, "account", "add", "--name", "Antiga");
+    ok(db, "add", "--amount", "50", "--description", "x", "--category", "Mercado",
+      "--account", "Antiga");
+    const r = ok(db, "account", "rm", "--name", "Antiga");
+    assert.equal(r.transactions_kept, 1);
+    assert.equal(ok(db, "ls", "--period", "month").total_count, 1);
   });
 
-  test("conta padrão", () => {
-    const banco = novoBanco();
-    ok(banco, "conta", "add", "--nome", "Inter");
-    ok(banco, "conta", "padrao", "--nome", "Inter");
-    const r = ok(banco, "add", "--valor", "10", "--descricao", "x", "--categoria", "Mercado");
-    assert.equal(lanc(r).conta, "Inter");
+  test("default account", () => {
+    const db = freshDb();
+    ok(db, "account", "add", "--name", "Inter");
+    ok(db, "account", "default", "--name", "Inter");
+    const r = ok(db, "add", "--amount", "10", "--description", "x", "--category", "Mercado");
+    assert.equal(tx(r).account, "Inter");
   });
 
-  test("ambiguidade é reportada", () => {
-    const banco = novoBanco();
-    ok(banco, "conta", "add", "--nome", "Itaú Corrente");
-    ok(banco, "conta", "add", "--nome", "Itaú Poupança", "--tipo", "poupanca");
+  test("ambiguity is reported", () => {
+    const db = freshDb();
+    ok(db, "account", "add", "--name", "Itaú Corrente");
+    ok(db, "account", "add", "--name", "Itaú Poupança", "--type", "savings");
     assert.match(
-      erro(banco, "add", "--valor", "10", "--descricao", "x", "--conta", "Itaú"),
+      fails(db, "add", "--amount", "10", "--description", "x", "--account", "Itaú"),
       /Mais de uma conta/,
     );
   });
 
-  test("tipo de conta inválido", () => {
-    const banco = novoBanco();
-    assert.match(erro(banco, "conta", "add", "--nome", "X", "--tipo", "cripto"),
+  test("invalid account type", () => {
+    const db = freshDb();
+    assert.match(fails(db, "account", "add", "--name", "X", "--type", "crypto"),
       /Tipo de conta inválido/);
   });
 });
 
-describe("consultas e export", () => {
-  function povoado(): string {
-    const banco = novoBanco();
-    ok(banco, "add", "--valor", "100", "--descricao", "Mercado do mês",
-      "--categoria", "Mercado", "--tags", "essencial");
-    ok(banco, "add", "--valor", "50", "--descricao", "Uber aeroporto",
-      "--categoria", "Uber/99");
-    ok(banco, "add", "--tipo", "receita", "--valor", "5000", "--descricao", "Salário",
-      "--categoria", "Salário");
-    return banco;
+describe("queries and export", () => {
+  function populated(): string {
+    const db = freshDb();
+    ok(db, "add", "--amount", "100", "--description", "Mercado do mês",
+      "--category", "Mercado", "--tags", "essencial");
+    ok(db, "add", "--amount", "50", "--description", "Uber aeroporto", "--category", "Uber/99");
+    ok(db, "add", "--type", "income", "--amount", "5000", "--description", "Salário",
+      "--category", "Salário");
+    return db;
   }
 
-  test("filtro por categoria inclui as filhas", () => {
-    assert.equal(ok(povoado(), "ls", "--categoria", "Alimentação").quantidade_total, 1);
+  test("filtering by category includes its children", () => {
+    assert.equal(ok(populated(), "ls", "--category", "Alimentação").total_count, 1);
   });
 
-  test("filtro por tipo", () => {
-    assert.equal(ok(povoado(), "ls", "--tipo", "receita").quantidade_total, 1);
+  test("filtering by type", () => {
+    assert.equal(ok(populated(), "ls", "--type", "income").total_count, 1);
   });
 
-  test("filtro por tag", () => {
-    assert.equal(ok(povoado(), "ls", "--tag", "essencial").quantidade_total, 1);
+  test("filtering by tag", () => {
+    assert.equal(ok(populated(), "ls", "--tag", "essencial").total_count, 1);
   });
 
-  test("totais cobrem o filtro inteiro, não a página", () => {
-    const r = ok(povoado(), "ls", "--limite", "1");
-    assert.equal((r.lancamentos as unknown[]).length, 1);
-    assert.equal(r.quantidade_total, 3);
-    const totais = r.totais as { despesa: { centavos: number } };
-    assert.equal(totais.despesa.centavos, 15000);
+  test("totals cover the whole filter, not the page", () => {
+    const r = ok(populated(), "ls", "--limit", "1");
+    assert.equal((r.transactions as unknown[]).length, 1);
+    assert.equal(r.total_count, 3);
+    const totals = r.totals as { expense: { cents: number } };
+    assert.equal(totals.expense.cents, 15000);
   });
 
-  test("busca ignora caixa", () => {
-    assert.equal(ok(povoado(), "busca", "MERCADO").quantidade, 1);
+  test("search is case-insensitive", () => {
+    assert.equal(ok(populated(), "search", "MERCADO").count, 1);
   });
 
-  test("export CSV abre no Excel em português", () => {
-    const banco = povoado();
-    const destino = mkdtempSync(join(tmpdir(), "fin-export-"));
-    const r = ok(banco, "export", "--periodo", "mes", "--formato", "csv",
-      "--destino", destino);
-    assert.equal(r.quantidade, 3);
-    const conteudo = readFileSync(r.arquivo as string, "utf8");
-    assert.ok(conteudo.startsWith("﻿"), "falta o BOM que o Excel espera");
-    assert.match(conteudo, /id;data;tipo/);
-    assert.match(conteudo, /100,00/);
+  test("CSV export opens in Excel in Portuguese", () => {
+    const db = populated();
+    const dest = mkdtempSync(join(tmpdir(), "tally-export-"));
+    const r = ok(db, "export", "--period", "month", "--format", "csv", "--dest", dest);
+    assert.equal(r.count, 3);
+    const content = readFileSync(r.file as string, "utf8");
+    assert.ok(content.startsWith("﻿"), "missing the BOM Excel expects");
+    assert.match(content, /id;data;tipo/);
+    assert.match(content, /100,00/);
   });
 
-  test("export JSON e MD", () => {
-    const banco = povoado();
-    for (const formato of ["json", "md"]) {
-      const destino = mkdtempSync(join(tmpdir(), "fin-export-"));
-      const r = ok(banco, "export", "--periodo", "mes", "--formato", formato,
-        "--destino", destino);
-      assert.ok(existsSync(r.arquivo as string));
+  test("JSON and MD export", () => {
+    const db = populated();
+    for (const format of ["json", "md"]) {
+      const dest = mkdtempSync(join(tmpdir(), "tally-export-"));
+      const r = ok(db, "export", "--period", "month", "--format", format, "--dest", dest);
+      assert.ok(existsSync(r.file as string));
     }
   });
 
-  test("formato de export inválido", () => {
-    assert.match(erro(novoBanco(), "export", "--formato", "pdf"), /Formato inválido/);
+  test("invalid export format", () => {
+    assert.match(fails(freshDb(), "export", "--format", "pdf"), /Formato inválido/);
   });
 });
 
 describe("schema", () => {
-  test("init é idempotente", () => {
-    const dir = mkdtempSync(join(tmpdir(), "fin-schema-"));
-    const caminho = join(dir, "x.db");
-    assert.deepEqual(ok(caminho, "init").migrations_aplicadas, [1]);
-    const segundo = ok(caminho, "init");
-    assert.deepEqual(segundo.migrations_aplicadas, []);
-    const seed = segundo.seed as { categorias: number };
-    assert.equal(seed.categorias, 0);
+  test("init is idempotent", () => {
+    const dir = mkdtempSync(join(tmpdir(), "tally-schema-"));
+    const path = join(dir, "x.db");
+    assert.deepEqual(ok(path, "init").migrations_applied, [1]);
+    const second = ok(path, "init");
+    assert.deepEqual(second.migrations_applied, []);
+    const seeded = second.seed as { categories: number };
+    assert.equal(seeded.categories, 0);
   });
 
-  test("comando em banco novo auto-migra", () => {
-    // O agente pode chamar qualquer comando primeiro, sem `init` antes.
-    const dir = mkdtempSync(join(tmpdir(), "fin-schema-"));
-    const r = ok(join(dir, "novo.db"), "add", "--valor", "10", "--descricao", "primeiro");
-    assert.equal(lanc(r).id, 1);
+  test("any command auto-migrates a fresh database", () => {
+    // The agent may call any command first, with no `init` beforehand.
+    const dir = mkdtempSync(join(tmpdir(), "tally-schema-"));
+    const r = ok(join(dir, "new.db"), "add", "--amount", "10", "--description", "first");
+    assert.equal(tx(r).id, 1);
   });
 
-  test("categorias semeadas", () => {
-    const r = ok(novoBanco(), "categoria", "list");
-    const cats = r.categorias as Record<string, { subcategorias: string[] }>;
-    assert.ok(cats["Alimentação"]);
-    assert.ok(cats["Alimentação"].subcategorias.includes("Delivery"));
+  test("categories are seeded in Portuguese", () => {
+    const r = ok(freshDb(), "category", "list");
+    const categories = r.categories as Record<string, { children: string[] }>;
+    assert.ok(categories["Alimentação"]);
+    assert.ok(categories["Alimentação"].children.includes("Delivery"));
   });
 
-  test("subcomando desconhecido", () => {
-    assert.match(erro(novoBanco(), "investir", "--valor", "10"), /desconhecido/);
+  test("unknown subcommand", () => {
+    assert.match(fails(freshDb(), "invest", "--amount", "10"), /desconhecido/);
   });
 });

@@ -1,13 +1,13 @@
 {
-  "name": "financas-bot",
+  "name": "tallybot",
   "version": "1.0.0",
-  "description": "Agente financeiro pessoal no Telegram, sobre o Hermes Agent",
+  "description": "Tally — personal finance agent on Telegram, built on Hermes Agent",
   "private": true,
   "license": "MIT",
   "type": "module",
   "scripts": {
     "test": "node --test tests/fin.test.ts",
-    "fin": "node skills/financas/scripts/fin.ts"
+    "fin": "node skills/finance/scripts/fin.ts"
   },
   "engines": {
     "node": ">=24"
