@@ -313,26 +313,6 @@ ir buscar o caixa da outra de propósito: para isso, veja
 
 Detalhes em [docs/architecture.md](docs/architecture.md).
 
-## Antes de expor isso a mais alguém
-
-O agente tem um toolset `terminal` e o `.env` está montado em `/opt/data/.env`
-dentro do container. Quem consegue conversar com o bot consegue pedir a ele para
-imprimir a chave da OpenRouter e o token do bot — e, como está descrito acima, o
-caixa da outra pessoa. Isso é inerente a dar um shell a um agente, e é por isso que
-`TELEGRAM_ALLOWED_USERS` é a única trava que conta.
-
-Um item saiu dessa lista: com todo mundo cadastrado por convite e o
-`TALLY_ACCESS_CODE` apagado do `.env`, não há código de acesso no ambiente para ele
-imprimir. As outras credenciais continuam lá, e o resto do parágrafo continua
-valendo inteiro.
-
-Um ID a mais na allowlist não é "mais um usuário do bot": é mais uma pessoa com
-acesso ao container, às credenciais e aos dois caixas. Não existe um nível "só
-pode registrar gastos".
-
-A lista completa do que isso implica, mais o que fazer a respeito, está na
-[seção de segurança do deploy](docs/deploy.md#segurança).
-
 ## Documentação
 
 - [docs/setup.md](docs/setup.md) — instalação passo a passo
