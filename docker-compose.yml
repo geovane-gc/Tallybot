@@ -12,19 +12,25 @@ services:
       TZ: America/Sao_Paulo
       HERMES_UID: ${HERMES_UID:-10000}
       HERMES_GID: ${HERMES_GID:-10000}
-      HERMES_DASHBOARD: ${HERMES_DASHBOARD:-1}
-      HERMES_DASHBOARD_HOST: 0.0.0.0
+      # Off unless explicitly asked for: the dashboard displays API keys, so it
+      # should not be listening at all on a host that does not need it.
+      HERMES_DASHBOARD: ${HERMES_DASHBOARD:-0}
+      HERMES_DASHBOARD_HOST: 127.0.0.1
 
     env_file:
       - .env
 
     ports:
-      # Loopback only: the dashboard exposes API keys.
+      # Loopback only. Reach it over an SSH tunnel, never by widening this.
       - "127.0.0.1:${DASHBOARD_PORT:-9119}:9119"
 
     volumes:
       - ./data:/opt/data
-      - ./skills/finance:/opt/data/skills/finance
+      # Read-only by default. The agent holds a shell, so a writable mount lets
+      # it rewrite the code that runs on the next message — and those edits show
+      # up as git diffs you might commit unreviewed. Drop the `:ro` if you want
+      # the agent to be able to improve its own skill.
+      - ./skills/finance:/opt/data/skills/finance:ro
 
     deploy:
       resources:
@@ -33,11 +39,15 @@ services:
           cpus: "2.0"
 
     healthcheck:
-      test: ["CMD", "node", "-e", "process.exit(0)"]
+      # Checks that the supervised gateway process is actually alive. An earlier
+      # version ran `node -e "process.exit(0)"`, which passed even with a dead
+      # gateway — a healthcheck that cannot fail is worse than none, because
+      # `restart: unless-stopped` then never recovers a wedged container.
+      test: ["CMD-SHELL", "pgrep -f 'gateway run' > /dev/null"]
       interval: 60s
       timeout: 10s
       retries: 3
-      start_period: 30s
+      start_period: 60s
 
     logging:
       driver: json-file
@@ -47,9 +57,19 @@ services:
 
 # Design notes — why this file differs from the official Hermes compose:
 #
-#   * Bridge networking with published ports rather than `network_mode: host`:
-#     host networking does not work on Docker Desktop, and the Telegram gateway
-#     is outbound-only (long polling).
+#   * Bridge networking with published ports rather than `network_mode: host`.
+#     Host networking does not work on Docker Desktop, and the Telegram gateway
+#     is outbound-only (long polling), so nothing is lost.
+#
+#     ⚠️  Do NOT switch to `network_mode: host` to "match upstream". Under host
+#     networking the `127.0.0.1` prefix above stops applying, and Docker's port
+#     handling bypasses ufw/firewalld — an enabled dashboard would be reachable
+#     from the whole network. If you genuinely need host networking, set
+#     HERMES_DASHBOARD=0 and understand what else you are exposing.
+#
 #   * State lives in ./data, not ~/.hermes, isolating this bot from other agents.
-#   * The skill is mounted from ./skills and stays versioned in git; being
-#     read-write, any improvement the agent makes to it shows up as a diff.
+#
+#   * The skill is mounted read-only. Dropping the `:ro` lets the agent improve
+#     its own skill and show the edits as git diffs — but it also lets the agent
+#     rewrite the code that runs on the next message, and those diffs are easy to
+#     commit unreviewed. See the security section in docs/deploy.md.

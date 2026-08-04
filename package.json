@@ -6,7 +6,7 @@
   "license": "MIT",
   "type": "module",
   "scripts": {
-    "test": "node --test tests/fin.test.ts",
+    "test": "node --test tests/*.test.ts",
     "fin": "node skills/finance/scripts/fin.ts"
   },
   "engines": {

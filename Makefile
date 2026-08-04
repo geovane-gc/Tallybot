@@ -5,6 +5,27 @@ DATA := ./data
 DB   := $(DATA)/finance/tally.db
 FIN  := node skills/finance/scripts/fin.ts --db $(DB)
 
+# Whose ledger the shortcuts below act on, as a Telegram user id.
+#
+# Named TG_USER and not USER: make imports the environment, so USER already
+# holds your login name and `make balance` would silently ask for the ledger of
+# somebody called "geovane" — which does not exist, and the error would not say
+# why.
+TG_USER ?=
+
+# Every ledger target starts with this. `$@` is the target being run, so the
+# message tells you exactly what to retype.
+define need_user
+	@if [ -z "$(TG_USER)" ]; then \
+		echo "This ledger has one set of numbers per person, so pick one:"; \
+		echo; \
+		echo "    make $@ TG_USER=<telegram id>"; \
+		echo; \
+		echo "Run 'make users' to see the registered ids."; \
+		exit 1; \
+	fi
+endef
+
 .PHONY: help
 help: ## Show this help
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -66,23 +87,39 @@ cron-list: ## List the scheduled jobs
 doctor: ## Hermes diagnostics (keys, model, gateway)
 	docker compose exec hermes hermes doctor
 
+# --- access ------------------------------------------------------------------
+
+.PHONY: users
+users: ## List the registered people and their ids
+	@$(FIN) auth users
+
+.PHONY: logout-all
+logout-all: ## Force everyone to re-enter the access code (no data is deleted)
+	@$(FIN) auth logout-all
+
 # --- ledger (straight to the database, bypassing the agent) ------------------
+#
+# All of these need TG_USER=<telegram id>. See 'make users'.
 
 .PHONY: balance
-balance: ## Current balance per account
-	@$(FIN) balance
+balance: ## Current balance per account (needs TG_USER)
+	$(need_user)
+	@$(FIN) balance --user $(TG_USER)
 
 .PHONY: summary
-summary: ## Summary for the current month
-	@$(FIN) summary --period month
+summary: ## Summary for the current month (needs TG_USER)
+	$(need_user)
+	@$(FIN) summary --period month --user $(TG_USER)
 
 .PHONY: report
-report: ## Formatted monthly report
-	@$(FIN) report --period month
+report: ## Formatted monthly report (needs TG_USER)
+	$(need_user)
+	@$(FIN) report --period month --user $(TG_USER)
 
 .PHONY: export
-export: ## Export the month's transactions to CSV
-	@$(FIN) export --period month --format csv
+export: ## Export the month's transactions to CSV (needs TG_USER)
+	$(need_user)
+	@$(FIN) export --period month --format csv --user $(TG_USER)
 
 .PHONY: backup
 backup: ## Consistent database backup into backups/
@@ -92,7 +129,7 @@ backup: ## Consistent database backup into backups/
 
 .PHONY: test
 test: ## Run the test suite
-	node --test tests/fin.test.ts
+	node --test tests/*.test.ts
 
 .PHONY: clean-data
 clean-data: ## DELETE all local state (database, sessions, memories)

@@ -1,5 +1,8 @@
-# Secrets — OpenRouter key and bot token
-.env
+# Secrets — OpenRouter key, bot token, access code.
+# The glob catches the `.env.bak` that an interrupted `sed -i.bak` can leave
+# behind with real credentials in it, and any `.env.local` / `.env.prod` variant.
+.env*
+!.env.example
 
 # Hermes state and the ledger.
 # Everything here is generated at runtime and holds personal data: conversation
@@ -10,6 +13,23 @@
 
 # Backups produced by `make backup`
 /backups/
+
+# Financial data in any shape. `export --dest` accepts an arbitrary directory and
+# the skill is bind-mounted read-write, so an export can land inside the tree.
+exports/
+charts/
+*.png
+*.csv
+# ...but the import test fixtures are synthetic sample statements, not anybody's
+# money, and the suite fails without them. The rule above exists to stop a real
+# export from being committed; these are checked in on purpose.
+!tests/fixtures/*.csv
+*.db
+*.db-wal
+*.db-shm
+*.db.gz
+*.sqlite
+*.sqlite3
 
 # Node
 node_modules/
