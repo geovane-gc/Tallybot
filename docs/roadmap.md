@@ -74,16 +74,40 @@ que falta é uma função de ciclo — dado um cartão e uma data, em qual fatur
 compra cai — e um subcomando `bill` que agrupe por ciclo em vez de por mês
 civil. É o próximo passo mais útil para quem vive de cartão.
 
-## Vários usuários
+## Mais de duas pessoas
 
-O schema não tem coluna de usuário. Dois IDs na allowlist dividiriam a mesma
-carteira, o que pode até ser o desejado num casal com finanças conjuntas — mas é
-bom saber que é o comportamento.
+A separação por pessoa já existe: `user_id` em toda tabela de caixa, identidade
+lida de `HERMES_SESSION_USER_ID` e `UNIQUE` por usuário. Nada no `fin.ts` conta
+pessoas, então o schema aguenta quantas linhas houver em `users`.
 
-Para separar: `user_id` nas tabelas, filtro em todas as consultas, e o gateway
-já entrega o ID do remetente do Telegram para o agente. É uma migration nova em
-`MIGRATIONS` (nunca editar a versão 1, que já está aplicada) mais o filtro no
-`fin.ts`.
+O que é feito para duas é o **acesso**: existe um código de acesso só, igual para
+todos. Isso significa que não há como revogar o acesso de uma pessoa sem forçar
+todas a redigitar (`make logout-all` é global). Para um grupo maior valeria um
+código por pessoa ou um convite de uso único: uma tabela `invites` com
+`(code_hash, used_at)`, e `auth login` consumindo o convite em vez de comparar com
+a variável de ambiente. O resto do caminho — a fan-out do cron, o `--user`, os
+índices — já é agnóstico à quantidade.
+
+O limite mais duro, porém, não é de quantidade: é que todas as pessoas dividem um
+container e um agente com shell, então nenhuma fica isolada das outras
+([deploy.md](deploy.md#as-duas-pessoas-não-estão-isoladas-uma-da-outra)). Isso
+escala mal com desconhecidos. Para um grupo em que as pessoas não confiam umas nas
+outras, o desenho certo não é mais uma coluna no banco — é uma instância por
+pessoa, ou um serviço de verdade entre o agente e os dados, com o agente sem
+acesso direto ao arquivo.
+
+## Despesa conjunta e rateio
+
+Hoje não existe nada compartilhado, por decisão: o bot nunca mostra o número de um
+para o outro, e não há soma do casal. Isso deixa "quanto nós dois gastamos de
+mercado esse mês?" sem resposta.
+
+O caminho menos invasivo é não mexer na separação e acrescentar por cima: uma
+tabela de vínculo entre lançamentos de pessoas diferentes (ou um `split_group`,
+como já existe `installment_group`), mais um subcomando que só some o que foi
+explicitamente marcado como conjunto. A parte difícil não é o SQL, é o produto:
+quem pode marcar, o que aparece para quem, e como o bot conta metade de um gasto
+sem contar o gasto inteiro duas vezes. Vale desenhar antes de codar.
 
 ## Import de extrato
 
@@ -122,7 +146,12 @@ mudanças ali valem imediatamente após `make restart`:
 - Categorizando errado com frequência? Acrescente os termos que você usa em
   `skills/finance/references/categories.md`.
 - Quer relatório em outro horário? `hermes/cron-jobs.sh`, depois
-  `make cron-install`.
+  `make cron-install`. Os horários valem para as duas pessoas: o script gera o
+  mesmo conjunto de cinco jobs para cada uma.
 
-Como a skill é montada read-write, o próprio agente pode ajustá-la durante o uso —
-e as mudanças aparecem como diff no git, para você revisar antes de manter.
+A skill é montada read-only por padrão. Removendo o `:ro` do
+`docker-compose.yml`, o próprio agente passa a poder ajustá-la durante o uso, e as
+mudanças aparecem como diff no git para você revisar antes de manter. É uma troca
+consciente, não um brinde — o outro lado está em
+[deploy.md](deploy.md#a-skill-é-montada-read-only): ele também pode alterar o
+código que roda na próxima mensagem, incluindo as checagens de identidade.

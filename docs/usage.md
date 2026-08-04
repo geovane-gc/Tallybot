@@ -2,6 +2,52 @@
 
 Não há comandos a memorizar. Escreva como você falaria com alguém.
 
+## A primeira mensagem: o código de acesso
+
+Antes de qualquer coisa, o bot pede um código:
+
+```
+você:  oi
+Tally: 🔒 Antes de falar de dinheiro eu preciso confirmar quem é você.
+       Me manda o código de acesso.
+
+você:  <o código combinado>
+Tally: ✅ Tudo certo, agora é só me contar seus gastos.
+```
+
+É uma vez só. Depois disso ele não pergunta mais.
+
+Cinco tentativas erradas travam o acesso, e aí só o dono do servidor libera (com
+`make logout-all`). Se o bot voltar a pedir o código do nada, foi esse comando
+que rodou — é só digitar de novo, nada foi perdido.
+
+O bot nunca repete nem confirma o código. Se você perguntar qual é, ele diz que
+não tem.
+
+## Duas pessoas, dois caixas
+
+O mesmo bot atende duas pessoas, e cada uma tem o próprio caixa: contas,
+categorias, orçamentos, metas, despesas fixas e lançamentos.
+
+Na prática, conversando com ele:
+
+- As duas podem ter uma conta chamada "Nubank". São contas diferentes.
+- Você só vê os seus números. Relatório, busca, saldo, export: tudo sai filtrado
+  pelo seu caixa, e citar o número de um lançamento da outra pessoa não funciona —
+  o bot responde que não achou aquele lançamento.
+- O bot não soma nem compara as duas. Se você perguntar quanto a outra pessoa
+  gastou, ele diz que só cuida dos números de cada um separadamente.
+
+Você não precisa se identificar. O bot sabe quem está escrevendo porque o gateway
+do Telegram informa, não porque alguém digitou um ID.
+
+**Uma ressalva honesta:** isso garante que os dois caixas não se misturam, não que
+um seja secreto para o outro. As duas pessoas compartilham um container e um
+arquivo de banco, e o bot tem acesso ao terminal — quem souber pedir consegue
+chegar ao caixa do outro. É um bot para duas pessoas que confiam uma na outra. Se
+a expectativa for outra, veja
+[isolamento real](deploy.md#as-duas-pessoas-não-estão-isoladas-uma-da-outra).
+
 ## Registrar gastos
 
 ```
@@ -225,6 +271,22 @@ cria uma categoria de doações
 Já vêm 17 categorias e ~70 subcategorias. Você não precisa criar nada para
 começar. O bot escolhe a categoria sozinho; se errar, corrija e siga.
 
+## Relatórios automáticos
+
+Sem ninguém pedir, e sempre na conversa privada de cada um:
+
+| Quando | O que chega |
+|---|---|
+| 06:00 | As despesas fixas do dia, já lançadas |
+| 09h, 15h e 21h | Alerta, só se algum limite apertou |
+| 21:00 | Resumo do dia (silencioso se não houve gasto) |
+| Domingo, 20:00 | Fechamento da semana |
+| Dia 1º, 09:00 | Fechamento do mês, com a planilha anexada |
+
+Quem não autenticou não recebe nada, porque não há caixa para relatar. Depois que
+alguém novo entra, o dono do servidor precisa rodar `make cron-install` de novo
+para criar os jobs daquela pessoa.
+
 ## O que ele não faz
 
 - **Não lê áudio nem foto de comprovante** nesta versão (ver
@@ -235,22 +297,31 @@ começar. O bot escolhe a categoria sozinho; se errar, corrija e siga.
   chutar. Preferi um bot que pergunta a um bot que registra errado.
 - **Não conversa espontaneamente.** Fora dos relatórios agendados e dos alertas
   de limite, ele só fala quando você fala.
+- **Não mostra o dinheiro da outra pessoa.** Nenhum relatório, saldo ou busca
+  atravessa de um caixa para o outro. (Isso é uma regra que ele cumpre, não uma
+  parede — ver a ressalva em [Duas pessoas, dois caixas](#duas-pessoas-dois-caixas).)
 
 ## Atalhos pelo terminal
 
-Consultas rápidas, sem gastar requisição do modelo:
+Para quem tem acesso ao servidor. Consultas rápidas, sem gastar requisição do
+modelo — e cada uma precisa saber de qual caixa você está falando:
 
 ```bash
-make balance
-make summary
-make report
-make export
+make users                       # lista quem está cadastrado, com os IDs
+make balance TG_USER=123456789
+make summary TG_USER=123456789
+make report  TG_USER=123456789
+make export  TG_USER=123456789
 ```
 
-Ou a CLI completa:
+`TG_USER` e não `USER`: o `make` importa o ambiente, e `USER` já contém o seu nome
+de login no shell.
+
+Ou a CLI completa. Fora de uma sessão do Telegram não existe identidade nenhuma,
+então `--user` é obrigatório:
 
 ```bash
 node skills/finance/scripts/fin.ts --db data/finance/tally.db --help
 node skills/finance/scripts/fin.ts --db data/finance/tally.db \
-    ls --period 30d --category Alimentação
+    ls --period 30d --category Alimentação --user 123456789
 ```
