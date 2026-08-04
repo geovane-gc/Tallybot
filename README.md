@@ -10,9 +10,6 @@ uma garantia de **correção**, não de sigilo entre as duas — leia
 [Duas pessoas, dois caixas](#duas-pessoas-dois-caixas) antes de contar com ela
 como se fosse.
 
-O bot conversa em português. O código é em inglês — a divisão está explicada em
-[Idiomas](#idiomas) mais abaixo.
-
 Construído sobre o [Hermes Agent](https://github.com/NousResearch/hermes-agent)
 da Nous Research, rodando em Docker, com modelo gratuito via OpenRouter.
 
