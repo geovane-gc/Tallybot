@@ -71,8 +71,9 @@ process.stdin.on("data", (d) => (raw += d)).on("end", () => {
 if (( ${#targets[@]} == 0 )); then
   echo "No authenticated users yet, so there is nobody to send reports to." >&2
   echo >&2
-  echo "Have each person message the bot on Telegram and enter the access code" >&2
-  echo "from TALLY_ACCESS_CODE, then run 'make cron-install' again." >&2
+  echo "Mint one invite per person on the host ('make invite LABEL=\"...\"') or use" >&2
+  echo "the shared TALLY_ACCESS_CODE, have each of them message the bot and type" >&2
+  echo "it, then run 'make cron-install' again." >&2
   exit 1
 fi
 

@@ -13,6 +13,14 @@ FIN  := node skills/finance/scripts/fin.ts --db $(DB)
 # why.
 TG_USER ?=
 
+# Who an invite is for, and how long it lasts. LABEL is only for your own audit —
+# 'make invites' shows it, so "the one I gave to X" stays answerable later.
+LABEL ?=
+HOURS ?=
+
+# Which invite to revoke, as the number from 'make invites'.
+ID ?=
+
 # Every ledger target starts with this. `$@` is the target being run, so the
 # message tells you exactly what to retype.
 define need_user
@@ -22,6 +30,27 @@ define need_user
 		echo "    make $@ TG_USER=<telegram id>"; \
 		echo; \
 		echo "Run 'make users' to see the registered ids."; \
+		exit 1; \
+	fi
+endef
+
+define need_label
+	@if [ -z "$(LABEL)" ]; then \
+		echo "An invite is for one person, so say who it is for:"; \
+		echo; \
+		echo "    make $@ LABEL=\"Namorada\" [HOURS=48]"; \
+		echo; \
+		echo "The label never leaves this machine — it is what makes 'revoke the"; \
+		echo "one I gave to her' answerable in 'make invites' a month from now."; \
+		exit 1; \
+	fi
+endef
+
+define need_id
+	@if [ -z "$(ID)" ]; then \
+		echo "Which invite? Take the number from 'make invites':"; \
+		echo; \
+		echo "    make $@ ID=3"; \
 		exit 1; \
 	fi
 endef
@@ -93,8 +122,32 @@ doctor: ## Hermes diagnostics (keys, model, gateway)
 users: ## List the registered people and their ids
 	@$(FIN) auth users
 
+# The code is printed once, here, and nowhere else ever again: only its SHA-256
+# goes into the database. Read it out in person — it must not travel through the
+# chat it protects.
+.PHONY: invite
+invite: ## Mint a single-use invite code (needs LABEL, optional HOURS)
+	$(need_label)
+	@$(FIN) auth invite --label "$(LABEL)" $(if $(HOURS),--hours $(HOURS))
+
+.PHONY: invites
+invites: ## Status of every invite (never the codes)
+	@$(FIN) auth invites
+
+.PHONY: revoke-invite
+revoke-invite: ## Kill an invite nobody redeemed yet (needs ID)
+	$(need_id)
+	@$(FIN) auth revoke-invite $(ID)
+
+# The scalpel: one person out, everybody else untouched. 'logout-all' is the
+# panic button. Neither deletes a transaction.
+.PHONY: revoke
+revoke: ## Revoke ONE person's access, keeping all their data (needs TG_USER)
+	$(need_user)
+	@$(FIN) auth revoke --user $(TG_USER)
+
 .PHONY: logout-all
-logout-all: ## Force everyone to re-enter the access code (no data is deleted)
+logout-all: ## Force EVERYONE to re-enter a code (no data is deleted)
 	@$(FIN) auth logout-all
 
 # --- ledger (straight to the database, bypassing the agent) ------------------

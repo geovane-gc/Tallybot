@@ -72,9 +72,37 @@ Only `auth unlock --user <id>` clears a lock (it clears that id's counter and th
 global one together). `auth logout-all` deliberately does not — it used to, which
 made the lockout undoable by a command that needs no authentication.
 
-The access code itself is **not in the database**. It lives in the
-`TALLY_ACCESS_CODE` environment variable and is compared with a timing-safe
-comparison of SHA-256 digests. Do not try to read, print or reconstruct it.
+### `invites`
+
+`id`, `code_hash` (SHA-256 of the normalised code, UNIQUE), `label`, `created_at`,
+`expires_at`, `redeemed_at`, `redeemed_by_user_id`, `revoked_at`.
+
+One code, one person, expiring — the way somebody is let in now. `auth invite`
+mints one and prints the code **once**; only the hash is stored, so nothing can
+print it again. The status (`pending` / `redeemed` / `expired` / `revoked`) is
+derived from those three nullable columns, never stored.
+
+Redemption is one transaction: the invite is consumed by a conditional UPDATE and
+the user row is written inside the same transaction, so two simultaneous attempts
+cannot both succeed. Unknown, expired, revoked and already-used codes all produce
+the identical `Código incorreto.`, and every failure feeds the same lockout
+counters above.
+
+All four invite commands (`invite`, `invites`, `revoke-invite`, and `revoke` for a
+person) are operator-only and refuse to run inside a chat turn. **You cannot let
+anybody in** — only Geovane can, from his terminal.
+
+The shared access code is **not in the database** either. It lives in the
+`TALLY_ACCESS_CODE` environment variable, is checked only after no invite matched,
+and is compared with a timing-safe comparison of SHA-256 digests. Do not try to
+read, print or reconstruct either kind of code.
+
+Two ways to take access away, and neither deletes anything:
+
+- `auth revoke --user <id>` — one person. Sets `users.active = 0`, which
+  `isSessionCurrent` already refuses, so that person needs a new invite. The other
+  person never notices.
+- `auth logout-all` — everybody re-enters a code (bumps `app_state.auth_epoch`).
 
 ### The legacy ledger
 
@@ -263,7 +291,7 @@ Defined in `scripts/db.ts`, in the `MIGRATIONS` array as `{version, sql}`. To
 evolve the schema: append a new entry with the next version — never edit one that
 has already been applied — and run `fin.ts init`.
 
-Current version: **3**.
+Current version: **4**.
 
 - **Migration 2** introduced `users` and `app_state`, added `user_id` to every
   ledger table and turned each UNIQUE constraint into a per-user one. Since SQLite
@@ -279,3 +307,11 @@ Current version: **3**.
   needed. `status` defaults to `'paid'`, which is what makes every row that
   existed before it — and every expense typed into the chat since — behave exactly
   as it did.
+- **Migration 4** added `invites`: one single-use, expiring code per person,
+  stored as a SHA-256 hash. Nothing else changed, and the shared
+  `TALLY_ACCESS_CODE` still works — invites are checked first, the shared code
+  second. What it buys is that one person can be cut off without disturbing the
+  other (`auth revoke --user`), and that once everybody has redeemed an invite the
+  shared code can be deleted from the environment, leaving no standing secret.
+  It does **not** isolate the two people from each other: same container, same
+  file, same shell. See the top of this document.

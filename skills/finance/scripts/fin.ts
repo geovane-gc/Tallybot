@@ -45,13 +45,18 @@
  *   shell, this file cannot save you; harden the gateway.
  * - Authentication is enforced *here*, not by the agent, for the same reason and
  *   with the same limit: every data subcommand refuses to run for someone who has
- *   not entered the access code.
- * - A few subcommands (`auth users`, `auth logout-all`, `auth unlock`,
+ *   not entered a code.
+ * - The code is either a **per-person invite** (single use, expiring, minted in
+ *   the terminal with `auth invite`) or the **shared `TALLY_ACCESS_CODE`**, which
+ *   still works. From the chat's point of view they are the same thing: a string
+ *   the person types once.
+ * - A few subcommands (`auth users`, `auth invite`, `auth invites`,
+ *   `auth revoke-invite`, `auth revoke`, `auth logout-all`, `auth unlock`,
  *   `auth adopt-legacy`, and `auth status` without a `--user`) are host/operator
  *   commands. They refuse to run when a gateway session identity is bound, so the
- *   bot cannot enumerate both people or log everybody out because somebody in a
- *   chat asked it to. The Makefile and `cron-jobs.sh` bind no session, so they
- *   keep working.
+ *   bot cannot enumerate both people, mint itself an invite or log everybody out
+ *   because somebody in a chat asked it to. The Makefile and `cron-jobs.sh` bind
+ *   no session, so they keep working.
  */
 
 import { parseArgs } from "node:util";
@@ -64,19 +69,23 @@ import {
   ACCOUNT_TYPES,
   AuthRequiredError,
   CURRENT_SCHEMA_VERSION,
+  DEFAULT_INVITE_HOURS,
   FinError,
   LEGACY_TELEGRAM_ID,
   MAX_FAILED_ATTEMPTS,
   MAX_GLOBAL_FAILED_ATTEMPTS,
+  MAX_INVITE_HOURS,
   TRANSACTION_STATUSES,
   TRANSACTION_TYPES,
   addDays,
   addMonths,
   adoptLegacy,
+  anyInvites,
   applyTags,
   categoryAndChildrenIds,
   clearFailedAttempts,
   connect,
+  createInvite,
   currentVersion,
   findUser,
   formatMoney,
@@ -90,6 +99,7 @@ import {
   isSessionCurrent,
   isValidMonth,
   lastDayOfMonth,
+  listInvites,
   listUsers,
   migrate,
   monthOf,
@@ -98,12 +108,16 @@ import {
   parseDate,
   periodRange,
   recordFailedAttempt,
+  redeemInvite,
   resolveAccount,
   resolveCategory,
+  revokeInvite,
+  revokeUser,
   seedUser,
   serializeTransaction,
   setGlobalAuthEpoch,
   setSetting,
+  sharedCodeConfigured,
   today,
   transaction,
   verifyAccessCode,
@@ -351,6 +365,15 @@ const GLOBALLY_LOCKED_OUT =
   "Peça ao Geovane para liberar o acesso.";
 
 /**
+ * The one answer to every code that does not open the door.
+ *
+ * A constant, and used in exactly one place, so that "unknown code", "expired
+ * invite", "revoked invite" and "invite already used" cannot drift apart. If they
+ * differed, typing a spent code would confirm to an outsider that it once existed.
+ */
+const WRONG_CODE = "Código incorreto.";
+
+/**
  * A user as the outside world sees them.
  *
  * No attempt count beyond the locked flag, and never anything derived from the
@@ -385,6 +408,51 @@ function deliverableChatId(caller: Caller): string | null {
   return caller.chatId === caller.telegramUserId ? caller.chatId : null;
 }
 
+/**
+ * Writes the row that says this person is in, and returns their internal id.
+ *
+ * The upsert is the same for both ways in — an invite and the shared code differ
+ * only in what proved the caller may do this. `active = 1` is what brings a
+ * revoked person back: they redeem a new invite and find their ledger untouched.
+ */
+function registerUser(
+  db: Db,
+  caller: Caller,
+  name: string | null,
+  ts: string,
+  epoch: number,
+): number {
+  db.prepare(
+    "INSERT INTO users (telegram_user_id, telegram_chat_id, display_name," +
+      " authenticated_at, auth_epoch, active, created_at)" +
+      " VALUES (?, ?, ?, ?, ?, 1, ?)" +
+      " ON CONFLICT(telegram_user_id) DO UPDATE SET" +
+      "   telegram_chat_id = COALESCE(excluded.telegram_chat_id, telegram_chat_id)," +
+      "   display_name     = COALESCE(excluded.display_name, display_name)," +
+      "   authenticated_at = excluded.authenticated_at," +
+      "   auth_epoch       = excluded.auth_epoch," +
+      "   active           = 1",
+  ).run(caller.telegramUserId, deliverableChatId(caller), name, ts, epoch, ts);
+  return findUser(db, caller.telegramUserId)!.id;
+}
+
+/**
+ * The shared-code fallback, and what its absence means.
+ *
+ * An empty `TALLY_ACCESS_CODE` used to be a broken install, full stop. With
+ * invites it is also the *finished* install: everybody is registered, the variable
+ * is gone, and no standing secret is left for `env` to print. So the two cases are
+ * told apart by whether an invite was ever minted — if one was, a code that
+ * matched no invite is simply wrong and says exactly that, revealing nothing about
+ * how this install lets people in.
+ */
+function sharedCodeMatches(db: Db, code: string): boolean {
+  if (!sharedCodeConfigured() && anyInvites(db)) return false;
+  // Throws the "acesso não configurado" FinError when there is no shared code and
+  // no invite either, which is the genuinely unconfigured case.
+  return verifyAccessCode(code);
+}
+
 export function cmdAuth(db: Db, a: Args, positionals: string[]): Output {
   const action = positionals[0] ?? "status";
   const epoch = globalAuthEpoch(db);
@@ -403,43 +471,35 @@ export function cmdAuth(db: Db, a: Args, positionals: string[]): Output {
     if (isGloballyLocked(db)) throw new FinError(GLOBALLY_LOCKED_OUT);
     if (isLockedOut(db, caller.telegramUserId)) throw new FinError(LOCKED_OUT);
 
-    if (!verifyAccessCode(code)) {
-      // Counters live in `app_state`, keyed by the id — no `users` row is created
-      // for an id that only ever got the code wrong. That used to be a free way
-      // to plant rows in the user list.
-      recordFailedAttempt(db, caller.telegramUserId);
-      // Deliberately the same sentence whatever the state: how many attempts are
-      // left would tell an outsider whether that id was already known here.
-      throw new FinError(
-        isLockedOut(db, caller.telegramUserId) ? LOCKED_OUT : "Código incorreto.",
-      );
+    const ts = now();
+    const name = str(a, "name")?.trim() || null;
+    const register = () => registerUser(db, caller, name, ts, epoch);
+
+    // Resolution order, and it matters: a personal invite first, the shared code
+    // second. An invite is consumed and the user registered in one transaction, so
+    // two people redeeming the same code cannot both get in.
+    const invite = redeemInvite(db, code, register, ts);
+    if (!invite) {
+      if (!sharedCodeMatches(db, code)) {
+        // Counters live in `app_state`, keyed by the id — no `users` row is created
+        // for an id that only ever got the code wrong. That used to be a free way
+        // to plant rows in the user list. A wrong invite feeds these same counters:
+        // there is one lockout in this codebase, not one per way in.
+        recordFailedAttempt(db, caller.telegramUserId);
+        // Deliberately the same sentence whatever the state: how many attempts are
+        // left would tell an outsider whether that id was already known here, and
+        // "expired" versus "wrong" would tell them the code once existed.
+        throw new FinError(
+          isLockedOut(db, caller.telegramUserId) ? LOCKED_OUT : WRONG_CODE,
+        );
+      }
+      register();
     }
 
     // "New" means never authenticated, not "no row": the legacy placeholder from
     // migration 2 and an adopted ledger both leave a row waiting with
     // authenticated_at NULL.
     const isNew = !before || before.authenticated_at === null;
-    const ts = now();
-    const name = str(a, "name")?.trim() || null;
-
-    db.prepare(
-      "INSERT INTO users (telegram_user_id, telegram_chat_id, display_name," +
-        " authenticated_at, auth_epoch, active, created_at)" +
-        " VALUES (?, ?, ?, ?, ?, 1, ?)" +
-        " ON CONFLICT(telegram_user_id) DO UPDATE SET" +
-        "   telegram_chat_id = COALESCE(excluded.telegram_chat_id, telegram_chat_id)," +
-        "   display_name     = COALESCE(excluded.display_name, display_name)," +
-        "   authenticated_at = excluded.authenticated_at," +
-        "   auth_epoch       = excluded.auth_epoch," +
-        "   active           = 1",
-    ).run(
-      caller.telegramUserId,
-      deliverableChatId(caller),
-      name,
-      ts,
-      epoch,
-      ts,
-    );
 
     // Getting the code right is proof this is not a guesser, so the counters go
     // back to zero — including the global one, which would otherwise creep up on
@@ -454,6 +514,10 @@ export function cmdAuth(db: Db, a: Args, positionals: string[]): Output {
     return {
       action: "authenticated",
       new_user: isNew,
+      // Which way in was used. The invite's id, never its code — that was printed
+      // once, when it was minted, and only its hash was ever stored.
+      via: invite ? "invite" : "shared_code",
+      invite_id: invite ? invite.id : null,
       seed: seeded,
       user: publicUser(db, findUser(db, caller.telegramUserId)!, epoch),
       message: isNew
@@ -505,6 +569,104 @@ export function cmdAuth(db: Db, a: Args, positionals: string[]): Output {
     };
   }
 
+  if (action === "invite") {
+    // Operator-only, and this is the one that must never be reachable from a chat:
+    // a bot that can mint an invite is a bot that can invite whoever asks it to.
+    requireOperator(a, "invite");
+    const label = str(a, "label")?.trim();
+    if (!label) {
+      throw new FinError(
+        'Informe --label "<nome>" para saber depois de quem é esse convite.',
+      );
+    }
+    const hours = int(a, "hours") ?? DEFAULT_INVITE_HOURS;
+    if (hours < 1 || hours > MAX_INVITE_HOURS) {
+      throw new FinError(`--hours precisa ser entre 1 e ${MAX_INVITE_HOURS}.`);
+    }
+
+    const { invite, code } = createInvite(db, label, hours);
+    return {
+      action: "invite_created",
+      // The only time a code is ever in an output. Only its hash was stored, so
+      // there is no second chance to read it — not for the bot, not for the
+      // operator, not from a backup.
+      code,
+      invite,
+      hours,
+      message:
+        `🎟️ Convite de ${label}: ${code} — vale ${hours}h e serve uma vez só. ` +
+        "Dite pessoalmente; esse código não aparece de novo em lugar nenhum.",
+    };
+  }
+
+  if (action === "invites") {
+    // Operator-only for the same reason as `auth users`: it says who was invited
+    // and who came in. Never a code, not even part of one — only the hash was kept
+    // and not even that is returned.
+    requireOperator(a, "invites");
+    const invites = listInvites(db);
+    return {
+      count: invites.length,
+      pending: invites.filter((i) => i.status === "pending").length,
+      invites,
+    };
+  }
+
+  if (action === "revoke-invite") {
+    requireOperator(a, "revoke-invite");
+    const raw = positionals[1];
+    const id = Number(raw);
+    if (!raw || !Number.isInteger(id) || id < 1) {
+      throw new FinError(
+        "Informe o número do convite: `auth revoke-invite <id>`. Rode " +
+          "`auth invites` para ver a lista.",
+      );
+    }
+    const { invite, already_revoked } = revokeInvite(db, id);
+    return {
+      action: "invite_revoked",
+      invite,
+      already_revoked,
+      message: already_revoked
+        ? `🎟️ O convite #${id} já estava revogado.`
+        : `🎟️ Convite #${id} revogado. Se alguém já tinha esse código, ele não vale mais.`,
+    };
+  }
+
+  if (action === "revoke") {
+    // The scalpel. `logout-all` below is the panic button: it makes *everybody*
+    // re-authenticate. This one cuts off a single person and leaves the other
+    // working, which is the thing a single shared code could never do.
+    requireOperator(a, "revoke");
+    const target = str(a, "user")?.trim();
+    if (!target) {
+      throw new FinError(
+        "Informe --user <id do Telegram> para revogar o acesso de uma pessoa.",
+      );
+    }
+    validateUserOption(target);
+    const result = revokeUser(db, target, epoch);
+
+    // Said out loud because it is the difference between revoking access and
+    // thinking you did: while the shared code is in the environment, this person
+    // walks back in by typing it.
+    const sharedCodeActive = sharedCodeConfigured();
+    return {
+      action: "revoked",
+      ...result,
+      shared_code_active: sharedCodeActive,
+      message:
+        `🔒 Acesso de ${target} revogado, e só dele. Nenhum lançamento foi apagado ` +
+        `(${result.transactions_preserved} continuam no banco). Para voltar, essa ` +
+        "pessoa precisa de um convite novo." +
+        (sharedCodeActive
+          ? " Atenção: TALLY_ACCESS_CODE ainda está configurado, então ela pode " +
+            "entrar de novo com o código compartilhado — apague a variável do .env " +
+            "para a revogação valer de verdade."
+          : ""),
+    };
+  }
+
   if (action === "logout-all") {
     requireOperator(a, "logout-all");
     const invalidated = listUsers(db).filter((u) => isSessionCurrent(u, epoch)).length;
@@ -515,7 +677,8 @@ export function cmdAuth(db: Db, a: Args, positionals: string[]): Output {
     // `auth unlock` now, deliberately and per id.
     setGlobalAuthEpoch(db, next);
     // No data is touched. Every transaction, account and budget stays exactly
-    // where it was; only the sessions die.
+    // where it was; only the sessions die. Same promise as `auth revoke`, which is
+    // the per-person version of this.
     return {
       action: "logged_out_all",
       auth_epoch: next,
@@ -560,8 +723,8 @@ export function cmdAuth(db: Db, a: Args, positionals: string[]): Output {
   }
 
   throw new FinError(
-    `Ação de auth desconhecida: ${action}. Use login, status, users, logout-all, ` +
-      "unlock ou adopt-legacy.",
+    `Ação de auth desconhecida: ${action}. Use login, status, users, invite, ` +
+      "invites, revoke-invite, revoke, logout-all, unlock ou adopt-legacy.",
   );
 }
 
@@ -2480,7 +2643,14 @@ const COMMON_OPTIONS: Record<string, OptionType> = {
  */
 const SPECS: Record<string, Record<string, OptionType>> = {
   init: {},
-  auth: { user: "string", code: "string", name: "string" },
+  auth: {
+    user: "string",
+    code: "string",
+    name: "string",
+    // Minting only. `auth revoke-invite` takes the id as a positional, like `edit`.
+    label: "string",
+    hours: "string",
+  },
   add: {
     ...COMMON_OPTIONS,
     "dest-account": "string",
@@ -2598,8 +2768,12 @@ Identity and access:
   nothing has to be passed. Outside one — this shell, the Makefile, cron — pass
   --user <telegram id> (numeric, 5-20 digits); inside a session it may only
   repeat the session's own id. Every data subcommand refuses to run until that
-  person has authenticated with the code in TALLY_ACCESS_CODE; the refusal
-  carries "auth_required": true.
+  person has authenticated; the refusal carries "auth_required": true.
+
+  A code is either a per-person invite (single use, expires, minted below) or the
+  shared TALLY_ACCESS_CODE, which still works. Invites are checked first. Once
+  everybody has redeemed one, TALLY_ACCESS_CODE can be deleted from the
+  environment and no standing secret is left anywhere.
 
   These are guardrails, not a security boundary: anything with a shell here can
   unset the variable or open the database directly. The boundary is the Hermes
@@ -2611,10 +2785,18 @@ Identity and access:
 Operator commands (refused when a gateway session is bound — no chat can run them):
   node fin.ts auth status                    # everybody's state at once
   node fin.ts auth users                     # machine-readable, for the cron fan-out
-  node fin.ts auth logout-all                # everybody re-enters the code; no data lost
+  node fin.ts auth invite --label "Namorada" [--hours 48]
+                                             # mints one code, prints it ONCE
+  node fin.ts auth invites                   # status of every invite; never a code
+  node fin.ts auth revoke-invite 3           # kills one that was not used yet
+  node fin.ts auth revoke --user 123456789   # cuts off one person; keeps their data
+  node fin.ts auth logout-all                # everybody re-enters a code; no data lost
   node fin.ts auth unlock --user 123456789   # lifts a lockout, per id and global
   node fin.ts auth adopt-legacy --user 123456789
                                              # hands the pre-multi-user ledger to a person
+
+  revoke is the scalpel and logout-all is the panic button: one person, versus
+  everybody re-authenticating. Neither deletes a single transaction.
 
 Paid and pending:
   A fixed cost generates an occurrence when it falls due. Unless the entry is

@@ -74,27 +74,44 @@ que falta é uma função de ciclo — dado um cartão e uma data, em qual fatur
 compra cai — e um subcomando `bill` que agrupe por ciclo em vez de por mês
 civil. É o próximo passo mais útil para quem vive de cartão.
 
-## Mais de duas pessoas
+## Mais de duas pessoas — ✅ feito (a parte de acesso)
 
-A separação por pessoa já existe: `user_id` em toda tabela de caixa, identidade
-lida de `HERMES_SESSION_USER_ID` e `UNIQUE` por usuário. Nada no `fin.ts` conta
-pessoas, então o schema aguenta quantas linhas houver em `users`.
+Esta entrada juntava duas coisas diferentes. Vale separar, porque uma nunca foi um
+problema e a outra foi resolvida:
 
-O que é feito para duas é o **acesso**: existe um código de acesso só, igual para
-todos. Isso significa que não há como revogar o acesso de uma pessoa sem forçar
-todas a redigitar (`make logout-all` é global). Para um grupo maior valeria um
-código por pessoa ou um convite de uso único: uma tabela `invites` com
-`(code_hash, used_at)`, e `auth login` consumindo o convite em vez de comparar com
-a variável de ambiente. O resto do caminho — a fan-out do cron, o `--user`, os
-índices — já é agnóstico à quantidade.
+**N usuários já funcionava** desde a migration 2 e não custou nada: `user_id` em
+toda tabela de caixa, identidade lida de `HERMES_SESSION_USER_ID`, `UNIQUE` por
+usuário. Nada no `fin.ts` conta pessoas, e a fan-out do cron, o `--user` e os
+índices sempre foram agnósticos à quantidade. Não havia o que entregar aqui.
 
-O limite mais duro, porém, não é de quantidade: é que todas as pessoas dividem um
-container e um agente com shell, então nenhuma fica isolada das outras
-([deploy.md](deploy.md#as-duas-pessoas-não-estão-isoladas-uma-da-outra)). Isso
-escala mal com desconhecidos. Para um grupo em que as pessoas não confiam umas nas
-outras, o desenho certo não é mais uma coluna no banco — é uma instância por
-pessoa, ou um serviço de verdade entre o agente e os dados, com o agente sem
-acesso direto ao arquivo.
+**O que faltava era acesso por pessoa, e é o que a migration 4 entregou.** Existe
+uma tabela `invites` — `(code_hash, label, created_at, expires_at, redeemed_at,
+redeemed_by_user_id, revoked_at)`, um pouco mais que o `(code_hash, used_at)`
+esboçado aqui, porque expirar e revogar valem a coluna. O `auth login` consome o
+convite antes de olhar para a variável de ambiente:
+
+```bash
+make invite LABEL="Namorada" HOURS=48   # código de uso único, aparece uma vez só
+make invites                            # estado de cada um, nunca o código
+make revoke-invite ID=3                 # mata um convite não usado
+make revoke TG_USER=123456789           # tira o acesso de UMA pessoa, sem apagar dado
+```
+
+O `TALLY_ACCESS_CODE` continua funcionando como modo simples — quebrar uma
+instalação que já roda não era opção —, e o ganho de verdade é poder apagá-lo depois
+que todo mundo entrou: aí não existe segredo permanente em lugar nenhum, o que
+importa porque o agente tem shell e lê o próprio ambiente. Detalhes em
+[setup.md](setup.md#4-escolher-como-as-pessoas-entram) e
+[architecture.md](architecture.md#modelo-de-dados).
+
+**O limite duro continua exatamente onde estava**, e o convite não mexeu nele: todas
+as pessoas dividem um container e um agente com shell, então nenhuma fica isolada
+das outras
+([deploy.md](deploy.md#as-duas-pessoas-não-estão-isoladas-uma-da-outra)). Convite
+melhora cadastro e revogação, não isolamento. Isso escala mal com desconhecidos:
+para um grupo em que as pessoas não confiam umas nas outras, o desenho certo não é
+mais uma coluna no banco — é uma instância por pessoa, ou um serviço de verdade
+entre o agente e os dados, com o agente sem acesso direto ao arquivo.
 
 ## Despesa conjunta e rateio
 

@@ -92,11 +92,21 @@ Hermes checa o remetente no gateway, **antes** de o modelo rodar, e sem allowlis
 nega todo mundo. Quem não está na lista não chega ao bot. Todo o resto está dentro
 do raio de alcance de quem está.
 
-**O código de acesso é um cadastro, não uma trava.** Cada uma digita
-`TALLY_ACCESS_CODE` uma vez, na primeira conversa. Isso amarra cada lançamento a
-uma pessoa e dá uma etapa explícita de entrada. Ele vive no ambiente do processo
-que o agente dispara, então **o agente consegue lê-lo** — não conte com ele para
-proteger o dinheiro de uma pessoa da outra.
+**O código de acesso é um cadastro, não uma trava.** Cada uma digita um código uma
+vez, na primeira conversa. Isso amarra cada lançamento a uma pessoa e dá uma etapa
+explícita de entrada — não protege uma pessoa da outra.
+
+**Cada pessoa tem o convite dela.** `make invite LABEL="Namorada"` gera um código
+de uso único que expira (`7K2M-QX9P-4TVB`, feito para ser ditado em voz alta), e o
+banco guarda só o SHA-256 dele. Com isso dá para **cortar o acesso de uma pessoa
+sem incomodar a outra** (`make revoke TG_USER=<id>`, que não apaga nenhum dado), e
+depois que todo mundo entrou você **apaga o `TALLY_ACCESS_CODE` do `.env`** — aí não
+sobra segredo permanente em lugar nenhum, o que importa porque o agente tem shell e
+consegue ler o ambiente. O código compartilhado continua funcionando como modo
+simples, para quem não quer gerar convite.
+
+O bot não cria convite: `auth invite` só roda no seu terminal, e ele recusa dentro
+de uma conversa. Um bot que pode convidar é um bot que convida quem pedir.
 
 **A identidade vem do ambiente, não do modelo.** O Hermes exporta
 `HERMES_SESSION_USER_ID` em todo processo que o agente dispara, e o `fin.ts` lê
@@ -125,8 +135,12 @@ Então, sem rodeio: **as checagens dentro do `fin.ts` são guardrails.** Elas
 impedem o bot de cruzar os caixas quando simplesmente lhe pedem, o que cobre o
 acidente e o pedido casual. Não são uma parede contra quem sabe o que está
 pedindo. Recusar um `--user` divergente protege contra um erro honesto, nada além.
-O código de acesso também não ajuda aqui: o agente consegue lê-lo no próprio
-ambiente.
+
+**Convite também não ajuda aqui**, e é importante não confundir: ele resolve
+cadastro e revogação (dar acesso a uma pessoa, tirar de uma só, não deixar segredo
+permanente no ambiente). Ele não isola ninguém — depois de cadastradas, as duas
+pessoas continuam dividindo um container, um arquivo de banco e um agente com
+shell.
 
 Traduzindo: `TELEGRAM_ALLOWED_USERS` é a única fronteira real, e ela protege vocês
 dois de terceiros — não um do outro. Para duas pessoas que confiam uma na outra,
@@ -137,24 +151,31 @@ bancos, nada compartilhado ([docs/deploy.md](docs/deploy.md#segurança)).
 
 ## Começando
 
-Você precisa de Docker e de quatro coisas:
+Você precisa de Docker e de três coisas:
 
 1. **Token do bot** — mande `/newbot` para o [@BotFather](https://t.me/BotFather).
 2. **Os IDs do Telegram das duas pessoas** — cada uma manda `/start` para o
    [@userinfobot](https://t.me/userinfobot). Os dois vão em
    `TELEGRAM_ALLOWED_USERS`, separados por vírgula.
 3. **Chave da OpenRouter** — em [openrouter.ai/keys](https://openrouter.ai/keys).
-4. **Um código de acesso** — `openssl rand -base64 24`. Combine pessoalmente; não
-   deixe escrito em conversa nenhuma.
 
 ```bash
 cp .env.example .env
-$EDITOR .env          # preencha os quatro valores acima
+$EDITOR .env          # preencha os três valores acima
 make up               # valida, prepara o banco e sobe o container
 ```
 
-Agora **as duas pessoas mandam mensagem para o bot e digitam o código**. Só
-depois:
+Depois, um convite para cada pessoa — o código sai na tela **uma vez só**, para você
+ditar pessoalmente:
+
+```bash
+make invite LABEL="Geovane"
+make invite LABEL="Namorada" HOURS=24
+```
+
+Agora **as duas mandam mensagem para o bot e digitam o código**. Com as duas
+dentro, apague o `TALLY_ACCESS_CODE` do `.env` (se você tinha posto um) e rode
+`make restart`: daí em diante não existe segredo permanente nenhum. Só depois:
 
 ```bash
 make cron-install     # agenda os relatórios de cada uma
@@ -179,8 +200,20 @@ make doctor        # diagnóstico: chaves, modelo, gateway
 make backup        # backup consistente do banco
 make test          # roda a suíte de testes
 make users         # quem está cadastrado, com os IDs do Telegram
-make logout-all    # todos digitam o código de novo (não apaga nada)
 ```
+
+Acesso — convidar uma pessoa e tirar uma pessoa são coisas separadas:
+
+```bash
+make invite LABEL="Namorada" [HOURS=48]   # código de uso único; aparece uma vez só
+make invites                              # estado de cada convite (nunca os códigos)
+make revoke-invite ID=3                   # mata um convite que ninguém usou
+make revoke TG_USER=123456789             # tira o acesso de UMA pessoa (não apaga nada)
+make logout-all                           # TODOS digitam o código de novo (não apaga nada)
+```
+
+`revoke` é o bisturi e `logout-all` é o botão de pânico. Nenhum dos dois apaga um
+lançamento: o caixa da pessoa continua inteiro e volta quando ela entra de novo.
 
 As consultas diretas ao banco pedem de quem é o caixa, com `TG_USER` (e não
 `USER`, que já é do shell):
@@ -284,9 +317,14 @@ Detalhes em [docs/architecture.md](docs/architecture.md).
 
 O agente tem um toolset `terminal` e o `.env` está montado em `/opt/data/.env`
 dentro do container. Quem consegue conversar com o bot consegue pedir a ele para
-imprimir a chave da OpenRouter, o token do bot e o próprio código de acesso — e,
-como está descrito acima, o caixa da outra pessoa. Isso é inerente a dar um shell
-a um agente, e é por isso que `TELEGRAM_ALLOWED_USERS` é a única trava que conta.
+imprimir a chave da OpenRouter e o token do bot — e, como está descrito acima, o
+caixa da outra pessoa. Isso é inerente a dar um shell a um agente, e é por isso que
+`TELEGRAM_ALLOWED_USERS` é a única trava que conta.
+
+Um item saiu dessa lista: com todo mundo cadastrado por convite e o
+`TALLY_ACCESS_CODE` apagado do `.env`, não há código de acesso no ambiente para ele
+imprimir. As outras credenciais continuam lá, e o resto do parágrafo continua
+valendo inteiro.
 
 Um ID a mais na allowlist não é "mais um usuário do bot": é mais uma pessoa com
 acesso ao container, às credenciais e aos dois caixas. Não existe um nível "só

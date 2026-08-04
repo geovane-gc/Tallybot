@@ -4,9 +4,10 @@ Do zero ao bot respondendo: uns 15 minutos, a maior parte esperando o download
 da imagem.
 
 O bot atende **duas pessoas**, com as finanças separadas. Isso muda dois pontos
-da instalação: os dois IDs entram na allowlist, e existe um código de acesso que
-cada uma digita uma vez. A ordem no fim também muda — os relatórios agendados só
-podem ser criados depois que as duas autenticaram.
+da instalação: os dois IDs entram na allowlist, e cada uma digita um código de
+acesso uma vez — um **convite** dela (o caminho recomendado) ou um código
+compartilhado (o caminho simples). A ordem no fim também muda — os relatórios
+agendados só podem ser criados depois que as duas autenticaram.
 
 ## Pré-requisitos
 
@@ -82,26 +83,46 @@ lê o resultado e às vezes consulta o orçamento. Com 50/dia você registra uns
 gastos e acaba a cota. Os US$ 10 não são consumidos pelos modelos `:free` — o
 crédito só serve para destravar o limite. É o único gasto que vale a pena.
 
-## 4. Gerar o código de acesso
+## 4. Escolher como as pessoas entram
 
-É o código que cada pessoa digita uma vez, na primeira mensagem ao bot. Enquanto
-ela não digitar, o `fin.ts` recusa qualquer comando que envolva valor.
+Cada pessoa digita um código uma vez, na primeira mensagem ao bot. Enquanto ela não
+digitar, o `fin.ts` recusa qualquer comando que envolva valor. Existem dois modos, e
+eles funcionam ao mesmo tempo:
+
+| | Convite por pessoa (recomendado) | Código compartilhado (simples) |
+|---|---|---|
+| Como nasce | `make invite LABEL="Namorada"` | `TALLY_ACCESS_CODE` no `.env` |
+| Serve para | uma pessoa, uma vez | todo mundo, sempre |
+| Validade | expira (48h por padrão) | nunca |
+| Onde fica guardado | só o SHA-256, no banco | na variável de ambiente, para sempre |
+| Revogar uma pessoa | `make revoke TG_USER=<id>` | não dá sem mexer nas duas |
+
+**Para uma instalação nova, use convite.** O convite resolve três problemas do
+código único: dá para cortar o acesso de uma pessoa sem incomodar a outra, ele
+morre depois de ser usado (quem sabe o código não cadastra um segundo Telegram
+depois), e ele não fica no ambiente — o agente tem shell, e um `env | grep TALLY`
+mostra o que estiver lá.
+
+Mas o código compartilhado continua funcionando e não vai sair: se você já tem uma
+instalação rodando com `TALLY_ACCESS_CODE`, não precisa mudar nada. Para gerar um:
 
 ```bash
 openssl rand -base64 24
 ```
 
-Duas coisas sobre ele:
+Duas coisas valem para os dois modos:
 
 **Combine pessoalmente.** Falado, não escrito. Mandar o código pelo próprio
-Telegram (ou por qualquer chat) coloca o segredo no mesmo lugar que ele protege.
+Telegram (ou por qualquer chat) coloca o segredo no mesmo lugar que ele protege. Por
+isso o convite é gerado sem `0`/`O` e sem `1`/`I`/`L` — ele nasce para ser ditado em
+voz alta (`7K2M-QX9P-4TVB`).
 
 **Não é uma trava, é um cadastro.** A allowlist é a trava. O código serve para
 amarrar cada lançamento a uma pessoa e dar uma etapa explícita de entrada. Ele não
-protege de quem está fora da allowlist (essa pessoa nem chega aqui) e não protege
-uma das duas pessoas da outra — ele precisa estar no ambiente do processo que o
-agente dispara, então o agente consegue lê-lo. Ver
-[Segurança](#segurança) mais abaixo.
+protege de quem está fora da allowlist (essa pessoa nem chega aqui) e **não protege
+uma das duas pessoas da outra** — convite nenhum muda isso, porque o agente tem
+shell e o banco é um arquivo que ele abre. Convite melhora cadastro e revogação,
+não isolamento. Ver [Segurança](#segurança) mais abaixo.
 
 ## 5. Configurar
 
@@ -116,9 +137,14 @@ Abra o `.env` e preencha:
 OPENROUTER_API_KEY=sk-or-v1-...
 TELEGRAM_BOT_TOKEN=7123456789:AAF-...
 TELEGRAM_ALLOWED_USERS=123456789,987654321
-TALLY_ACCESS_CODE=<o que o openssl gerou>
+TALLY_ACCESS_CODE=<o que o openssl gerou; pode ficar vazio se você for de convite>
 TELEGRAM_HOME_CHANNEL=123456789
 ```
+
+`TALLY_ACCESS_CODE` é **opcional**. Deixando vazio, o `make up` avisa que a
+instalação roda só com convite e segue em frente — ele só reclama quando ninguém
+consegue entrar de jeito nenhum (sem código, sem convite e sem ninguém
+cadastrado).
 
 `TELEGRAM_HOME_CHANNEL` **não** é mais onde caem os relatórios agendados: cada
 pessoa recebe os dela na própria conversa privada. Ele hoje é só o destino de
@@ -139,11 +165,12 @@ make up
 
 O que acontece:
 
-1. Valida que as variáveis obrigatórias estão preenchidas — incluindo
-   `TALLY_ACCESS_CODE` — e para com uma mensagem clara se faltar alguma.
+1. Valida que as variáveis obrigatórias estão preenchidas (a chave da OpenRouter, o
+   token do bot e a allowlist) e para com uma mensagem clara se faltar alguma.
+   `TALLY_ACCESS_CODE` não está nessa lista de propósito — ver o passo 4.
 2. Escreve seu UID/GID no `.env` e garante `chmod 600` nele.
 3. Cria `data/` e copia `hermes/config.yaml`, `hermes/SOUL.md` e o `.env` para lá.
-4. Cria e migra o banco SQLite (hoje na versão 2 do schema).
+4. Cria e migra o banco SQLite (hoje na versão 4 do schema).
 5. Baixa a imagem oficial do Hermes (~4 GB na primeira vez) e sobe o container.
 
 Nada de categoria ou conta é criado aqui: a taxonomia é por pessoa, então ela
@@ -164,6 +191,39 @@ Você quer ver:
 
 ## 7. Primeira conversa: as duas pessoas autenticam
 
+Se você escolheu convite, gere um para cada pessoa **antes** — um comando por
+pessoa, no terminal do servidor:
+
+```bash
+make invite LABEL="Geovane"
+make invite LABEL="Namorada" HOURS=24
+```
+
+A saída traz o código **uma única vez**:
+
+```json
+{
+  "ok": true,
+  "code": "7K2M-QX9P-4TVB",
+  "invite": { "id": 2, "label": "Namorada", "status": "pending",
+              "expires_at": "2026-08-05T21:14:03-03:00" },
+  "message": "🎟️ Convite de Namorada: 7K2M-QX9P-4TVB — vale 24h e serve uma vez só…"
+}
+```
+
+**Só o hash vai para o banco**, então esse código não aparece de novo em lugar
+nenhum: nem em `make invites`, nem num backup, nem se você pedir de novo. Perdeu?
+Gera outro e revoga o antigo. Dite em voz alta, na frente da pessoa — ele foi
+desenhado para isso (sem `0`/`O`, sem `1`/`I`/`L`).
+
+`make invites` mostra o estado de todos, sem nunca mostrar código:
+
+```bash
+make invites
+# id 1  Geovane   redeemed  por 123456789
+# id 2  Namorada  pending   expira 05/08 21:14
+```
+
 No Telegram, cada uma manda para o bot:
 
 ```
@@ -177,11 +237,24 @@ Ele pede o código:
 Me manda o código de acesso.
 ```
 
-A mensagem seguinte é o código, digitado direto no chat. Na resposta certa:
+A mensagem seguinte é o código, digitado direto no chat — o convite dela, ou o
+código compartilhado, o bot trata igual. Pode digitar em minúscula, com espaço no
+lugar do traço ou sem separador nenhum: `7k2m qx9p 4tvb` funciona. Na resposta
+certa:
 
 ```
 ✅ Tudo certo, agora é só me contar seus gastos.
 ```
+
+Se o código não servir, a resposta é sempre a mesma — `Código incorreto.` — seja
+porque estava errado, porque o convite expirou, porque já foi usado ou porque você
+revogou. É de propósito: quem estiver testando códigos não aprende nada. E cinco
+erros seguidos travam aquela pessoa (ver [Se algo der errado](#se-algo-der-errado)).
+
+**O bot não cria convite.** `auth invite` é comando de operador e ele recusa dentro
+de uma conversa; se alguém pedir para o bot "adicionar uma pessoa", ele responde que
+só você faz isso, pelo terminal. Isso é essencial: um bot que pode convidar é um bot
+que convida quem pedir.
 
 Nesse momento o bot cria, para aquela pessoa, as 17 categorias, as ~70
 subcategorias, a conta padrão "Carteira" e as configurações iniciais. É o
@@ -213,6 +286,33 @@ Isso lê o banco direto, sem gastar requisição do modelo. `TG_USER` se chama a
 e não `USER` porque o `make` importa o ambiente do shell — `USER` já tem o seu
 nome de login, e o comando pediria o caixa de alguém que não existe sem dizer o
 motivo.
+
+### Apague o `TALLY_ACCESS_CODE` — é o ponto de tudo isso
+
+Com as duas pessoas cadastradas (confirme no `make users`: `authenticated: true`
+para as duas), apague a linha do `.env`:
+
+```ini
+TALLY_ACCESS_CODE=
+```
+
+```bash
+make restart
+```
+
+**Aí não sobra segredo permanente em lugar nenhum.** O convite já foi consumido e
+nunca esteve em texto claro no banco; o código compartilhado não existe mais no
+ambiente. Um `env | grep TALLY` dentro do container passa a não mostrar nada — e
+isso importa porque o agente tem shell e pode rodar exatamente esse comando. Era
+esse o achado que o convite resolve.
+
+O que continua funcionando depois de apagar: tudo. Quem já está cadastrado segue
+cadastrado (a sessão está no banco, não na variável). Quem entrar depois entra por
+convite. O `make up` não reclama da variável vazia.
+
+E o que muda de verdade: só depois de apagar é que `make revoke` significa alguma
+coisa. Com o código compartilhado no ambiente, a pessoa revogada volta digitando
+ele — o próprio comando avisa isso na resposta.
 
 ## 8. Agendar os relatórios
 
@@ -276,17 +376,22 @@ ar para alguém além de você.
 **A allowlist protege muito mais do que os números.** O agente tem o toolset
 `terminal` e o `.env` está montado em `/opt/data/.env` dentro do container. Quem
 consegue conversar com o bot consegue pedir a ele para imprimir a chave da
-OpenRouter, o token do bot e o próprio código de acesso. Isso é inerente a dar um
-shell a um agente; o código de acesso não impede, porque o shell existe antes
-dele. Portanto: `TELEGRAM_ALLOWED_USERS` só com os IDs de quem você confia nesse
-nível, e nunca `GATEWAY_ALLOW_ALL_USERS`.
+OpenRouter e o token do bot. Isso é inerente a dar um shell a um agente; código de
+acesso nenhum impede, porque o shell existe antes dele. Portanto:
+`TELEGRAM_ALLOWED_USERS` só com os IDs de quem você confia nesse nível, e nunca
+`GATEWAY_ALLOW_ALL_USERS`.
+
+O que o convite tira dessa lista é um item: com `TALLY_ACCESS_CODE` apagado, não há
+código de acesso no ambiente para o agente imprimir. As outras credenciais
+continuam lá.
 
 **As duas pessoas não estão isoladas uma da outra.** Os caixas não se misturam por
 acidente — isso é sólido, e é uma garantia de correção. Mas qualquer uma das duas
 consegue recuperar o caixa da outra pedindo ao bot para rodar um comando: é um
 container, um arquivo de banco e um agente com shell. As checagens de identidade
-dentro do `fin.ts` são guarda-corpos, não uma parede. Para um casal que confia um
-no outro isso é adequado; se você precisa de isolamento real, é
+dentro do `fin.ts` são guarda-corpos, não uma parede. **Convite não muda isso** —
+ele melhora cadastro e revogação, não isolamento. Para um casal que confia um no
+outro isso é adequado; se você precisa de isolamento real, é
 [uma instância por pessoa](deploy.md#as-duas-pessoas-não-estão-isoladas-uma-da-outra).
 
 **A skill é montada read-only** (`:ro` no compose), e é o padrão certo: sem isso o
@@ -299,13 +404,25 @@ agente faz na skill aparecem como diff no git para você revisar.
 o `.env.example` ainda vem com `HERMES_DASHBOARD=1`, então uma instalação nova
 sobe com ele ligado — troque para `0` se não for usar.
 
-**Se alguém precisar sair, ou o código vazar:** `make logout-all`. Todos digitam
-o código de novo e **nenhum dado é apagado**.
+**Se uma pessoa precisar sair:** `make revoke TG_USER=<id>`. Só ela perde o acesso,
+a outra não sente nada, e **nenhum dado é apagado** — o caixa dela continua inteiro
+e reaparece se ela voltar com um convite novo. Para valer de verdade, o
+`TALLY_ACCESS_CODE` precisa estar apagado do `.env`; senão ela volta digitando ele
+(o próprio comando te avisa). Rode `make cron-install` depois: ele recria os jobs a
+partir de quem está com sessão válida, e assim os relatórios agendados daquela
+pessoa param de ser disparados.
+
+**Se o código compartilhado vazar, ou você quiser zerar tudo:** `make logout-all`.
+Todo mundo digita o código de novo, e também não apaga nada. É o botão de pânico;
+`make revoke` é o bisturi.
 
 ## Se algo der errado
 
-**`Missing variables in .env`** — o bootstrap achou um campo vazio. Preencha e
-rode de novo. Se o que falta é `TALLY_ACCESS_CODE`, ele já sugere o `openssl`.
+**`Missing variables in .env`** — o bootstrap achou um campo obrigatório vazio
+(chave da OpenRouter, token do bot ou allowlist). Preencha e rode de novo.
+`TALLY_ACCESS_CODE` não entra aí: vazio é permitido, e o bootstrap só para se
+ninguém puder entrar — sem código, sem convite e sem ninguém cadastrado. A saída
+dele diz as duas opções.
 
 **`The token ... was rejected by the server`** — token errado ou revogado. Copie
 de novo do BotFather.
@@ -314,22 +431,35 @@ de novo do BotFather.
 `TELEGRAM_ALLOWED_USERS`? Sem estar na lista, o gateway ignora a mensagem em
 silêncio, de propósito. Confirme com `make logs`.
 
-**O bot pede o código de acesso de novo, do nada.** Alguém rodou `make logout-all`
-(inclusive você, talvez, para desbloquear alguém). Basta digitar o código outra
-vez; nenhum lançamento foi perdido.
+**O bot pede o código de acesso de novo, do nada.** Alguém rodou `make logout-all`,
+ou você revogou aquela pessoa com `make revoke`. No primeiro caso basta digitar o
+código outra vez; no segundo ela precisa de um convite novo. Em nenhum dos dois
+algum lançamento foi perdido.
+
+**"Código incorreto" e a pessoa jura que digitou certo.** A mensagem é a mesma para
+código errado, convite expirado, convite já usado e convite revogado — de propósito,
+para não confirmar a quem está testando que um código existiu. Confira o estado em
+`make invites`: se aparecer `expired` ou `revoked`, gere outro
+(`make invite LABEL="..."`). Maiúscula/minúscula e traço não importam.
 
 **"Bloqueei as tentativas depois de 5 códigos errados".** Cinco códigos errados
-seguidos travam aquela pessoa, e ela fica travada até você rodar:
+seguidos travam aquela pessoa, e ela fica travada até você liberar:
 
 ```bash
-make logout-all
+make users                                    # confirme o id
+node skills/finance/scripts/fin.ts \
+    --db data/finance/tally.db auth unlock --user 123456789
 ```
 
-Esse é o mesmo comando que zera o contador de tentativas. Ele encerra as sessões
-de todo mundo — as duas pessoas vão redigitar o código — e não apaga nada.
+`auth unlock` é o único comando que libera — e ele zera tanto o contador daquela
+pessoa quanto o contador global. `make logout-all` **não** libera (já liberou, um
+dia; como ele não exige autenticação nenhuma, isso fazia do bloqueio um enfeite).
 
-**"O acesso ainda não foi configurado no servidor".** `TALLY_ACCESS_CODE` está
-vazio no ambiente do container. Preencha no `.env` e rode `make restart`.
+**"O acesso ainda não foi configurado no servidor".** Não há `TALLY_ACCESS_CODE` no
+ambiente **e** nenhum convite foi gerado — ou seja, ninguém consegue entrar. Gere um
+convite (`make invite LABEL="..."`) ou preencha a variável no `.env` e rode
+`make restart`. Se já existe convite, essa mensagem não aparece: um código que não
+casa com nada é só `Código incorreto.`
 
 **`429` ou "rate limit" nos logs** — bateu o limite diário da OpenRouter. Espere
 o dia virar (o reset é em UTC) ou compre os US$ 10 de crédito.

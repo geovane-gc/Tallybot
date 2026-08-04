@@ -49,23 +49,32 @@ set_env_default() {
 set_env_default HERMES_UID "$(id -u)"
 set_env_default HERMES_GID "$(id -g)"
 
-# TALLY_ACCESS_CODE gates the ledger itself: without it every finance command
-# refuses to run, so a blank value is a broken bot rather than a lax one.
+env_value() {
+  grep -E "^${1}=" "$ROOT/.env" | head -1 | cut -d= -f2- || true
+}
+
 missing=()
-for var in OPENROUTER_API_KEY TELEGRAM_BOT_TOKEN TELEGRAM_ALLOWED_USERS TALLY_ACCESS_CODE; do
-  value="$(grep -E "^${var}=" "$ROOT/.env" | head -1 | cut -d= -f2- || true)"
-  [[ -z "$value" ]] && missing+=("$var")
+for var in OPENROUTER_API_KEY TELEGRAM_BOT_TOKEN TELEGRAM_ALLOWED_USERS; do
+  [[ -z "$(env_value "$var")" ]] && missing+=("$var")
 done
 
 if (( ${#missing[@]} > 0 )); then
   red "Missing variables in .env: ${missing[*]}"
-  if [[ " ${missing[*]} " == *" TALLY_ACCESS_CODE "* ]]; then
-    echo "Generate the access code with: openssl rand -base64 24"
-    echo "Both people type it once, on their first message to the bot."
-  fi
   echo "See docs/setup.md."
   exit 1
 fi
+
+# TALLY_ACCESS_CODE is deliberately NOT in the list above.
+#
+# It is the shared code, and the whole point of per-person invites is that it can
+# be deleted once everybody has redeemed one — a standing secret in the
+# environment is a secret the agent can print with `env` months later. Failing the
+# bootstrap over its absence would make the recommended end state impossible.
+#
+# What is still an error is nobody being able to get in *at all*: no shared code,
+# nobody registered, and no invite ever minted. That is checked below, after the
+# database exists.
+access_code="$(env_value TALLY_ACCESS_CODE)"
 
 mkdir -p "$DATA"/{skills,finance,logs}
 
@@ -82,5 +91,43 @@ green "config.yaml and SOUL.md synced from hermes/ into data/"
 node "$ROOT/skills/finance/scripts/fin.ts" \
   --db "$DATA/finance/tally.db" init >/dev/null
 green "Database ready at data/finance/tally.db"
+
+# --- how people get in -------------------------------------------------------
+if [[ -z "$access_code" ]]; then
+  fin() {
+    node "$ROOT/skills/finance/scripts/fin.ts" \
+      --db "$DATA/finance/tally.db" "$@" 2>/dev/null || echo '{}'
+  }
+  # Parsing in node rather than jq: jq is not in the Hermes image and node is
+  # right here. Same choice as hermes/cron-jobs.sh.
+  field() {
+    printf '%s' "$2" | node -e '
+      let raw = "";
+      process.stdin.on("data", (d) => (raw += d)).on("end", () => {
+        try { console.log(Number(JSON.parse(raw)[process.argv[1]] ?? 0)); }
+        catch { console.log(0); }
+      });' "$1"
+  }
+
+  registered="$(field count "$(fin auth users)")"
+  invites="$(field count "$(fin auth invites)")"
+
+  if (( registered == 0 && invites == 0 )); then
+    red "Nobody can get in: TALLY_ACCESS_CODE is empty, no invite was minted and"
+    red "no one is registered yet."
+    echo
+    echo "Pick one — the invite is the recommended way:"
+    echo "    make invite LABEL=\"Geovane\"      # single use, expires, prints once"
+    echo "    openssl rand -base64 24           # or a shared TALLY_ACCESS_CODE in .env"
+    echo
+    echo "See docs/setup.md."
+    exit 1
+  fi
+
+  yellow "TALLY_ACCESS_CODE is empty: this install runs on invites only."
+  echo   "  ${registered} person(s) registered, ${invites} invite(s) on record."
+  echo   "  Nothing to do — that is the intended end state (no standing secret)."
+  echo   "  One more person joins with: make invite LABEL=\"<nome>\""
+fi
 
 green "Bootstrap complete."

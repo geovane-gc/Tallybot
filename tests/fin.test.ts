@@ -123,6 +123,48 @@ function login(db: string, user: string, name?: string): Response {
   return ok(db, ...args);
 }
 
+/**
+ * Mints an invite the way the operator does, and keeps the code.
+ *
+ * The mint response is the only place a code ever appears, which is exactly what
+ * the leak test below pins down.
+ */
+function mintInvite(
+  db: string,
+  label = "Convidada",
+  hours?: number,
+): { code: string; id: number } {
+  const args = ["auth", "invite", "--label", label];
+  if (hours !== undefined) args.push("--hours", String(hours));
+  const r = ok(db, ...args);
+  return { code: r.code as string, id: (r.invite as { id: number }).id };
+}
+
+/** Types a code as `user`, without asserting anything about the outcome. */
+function redeem(db: string, user: string, code: string): Response {
+  return run(db, "auth", "login", "--user", user, "--code", code);
+}
+
+/**
+ * Pushes an invite's expiry into the past.
+ *
+ * There is no way to travel forward from the CLI, and `--hours 0` is refused, so
+ * the only honest way to test an expired invite is to age it in the file.
+ */
+function expireInvite(db: string, id: number): void {
+  const conn = new DatabaseSync(db);
+  try {
+    conn
+      .prepare("UPDATE invites SET expires_at = ? WHERE id = ?")
+      .run("2000-01-01T00:00:00-03:00", id);
+  } finally {
+    conn.close();
+  }
+}
+
+const inviteList = (r: Response) =>
+  r.invites as { id: number; status: string; label: string | null; redeemed_by: string | null }[];
+
 /** An empty database with only the schema in it. */
 function emptyDb(): string {
   const dir = mkdtempSync(join(tmpdir(), "tally-test-"));
@@ -1439,8 +1481,8 @@ describe("schema", () => {
     const dir = mkdtempSync(join(tmpdir(), "tally-schema-"));
     const path = join(dir, "x.db");
     const first = ok(path, "init");
-    assert.deepEqual(first.migrations_applied, [1, 2, 3]);
-    assert.equal(first.schema_version, 3);
+    assert.deepEqual(first.migrations_applied, [1, 2, 3, 4]);
+    assert.equal(first.schema_version, 4);
     const second = ok(path, "init");
     assert.deepEqual(second.migrations_applied, []);
     // Seeding moved to registration: `init` must not create a user, a category
@@ -1767,6 +1809,421 @@ describe("authentication", () => {
 
   test("unknown auth action", () => {
     assert.match(fails(freshDb(), "auth", "renew"), /desconhecida/);
+  });
+});
+
+describe("invites", () => {
+  test("an invite registers one person and is dead afterwards", () => {
+    const db = emptyDb();
+    const { code, id } = mintInvite(db, "Namorada");
+
+    const first = redeem(db, USER_A, code);
+    assert.equal(first.ok, true, first.error);
+    assert.equal(first.via, "invite");
+    assert.equal(first.invite_id, id);
+    assert.equal(ok(db, "ls", "--period", "all", "--user", USER_A).ok, true);
+
+    // Single use: the same code from anybody else, including the same person, is
+    // just a wrong code now.
+    assert.equal(redeem(db, USER_B, code).error, "Código incorreto.");
+    assert.equal(ok(db, "auth", "users").count, 1);
+
+    const listed = inviteList(ok(db, "auth", "invites"));
+    assert.equal(listed.length, 1);
+    assert.equal(listed[0].status, "redeemed");
+    assert.equal(listed[0].redeemed_by, USER_A);
+    assert.equal(listed[0].label, "Namorada");
+  });
+
+  test("a code typed by ear — lower case, spaces, no dashes — still works", () => {
+    // It is dictated in person, so it comes back typed however the person types.
+    // Refusing a code they heard correctly is the failure mode to avoid.
+    for (const shape of [
+      (c: string) => c.toLowerCase(),
+      (c: string) => c.replaceAll("-", ""),
+      (c: string) => c.toLowerCase().replaceAll("-", " "),
+      (c: string) => `  ${c.toLowerCase().replaceAll("-", "  ")} `,
+    ]) {
+      const db = emptyDb();
+      const { code } = mintInvite(db);
+      const r = redeem(db, USER_A, shape(code));
+      assert.equal(r.ok, true, `${shape(code)} was refused: ${r.error}`);
+      assert.equal(r.via, "invite");
+    }
+  });
+
+  test("the code has no character anyone can mishear", () => {
+    // 0/O and 1/I/L are what a dictated code gets wrong, and a wrong code spends
+    // one of the five attempts before the lockout.
+    const db = emptyDb();
+    for (let i = 0; i < 15; i++) {
+      const { code } = mintInvite(db, `Convite ${i}`);
+      assert.match(code, /^[0-9A-Z]{4}-[0-9A-Z]{4}-[0-9A-Z]{4}$/);
+      assert.ok(!/[01OIL]/.test(code), `ambiguous character in ${code}`);
+    }
+  });
+
+  test("an expired invite is refused", () => {
+    const db = emptyDb();
+    const { code, id } = mintInvite(db, "Vencida");
+    expireInvite(db, id);
+    assert.equal(redeem(db, USER_A, code).error, "Código incorreto.");
+    assert.equal(inviteList(ok(db, "auth", "invites"))[0].status, "expired");
+    assert.equal(ok(db, "auth", "users").count, 0);
+  });
+
+  test("a revoked invite is refused", () => {
+    const db = emptyDb();
+    const { code, id } = mintInvite(db, "Cancelada");
+    const r = ok(db, "auth", "revoke-invite", String(id));
+    assert.equal(r.already_revoked, false);
+    assert.equal(redeem(db, USER_A, code).error, "Código incorreto.");
+    assert.equal(inviteList(ok(db, "auth", "invites"))[0].status, "revoked");
+
+    // Revoking it again is not an error, and does not claim to have done anything.
+    assert.equal(ok(db, "auth", "revoke-invite", String(id)).already_revoked, true);
+  });
+
+  test("expired, revoked, spent and never-issued all say the same thing", () => {
+    // Otherwise the message tells an outsider which codes once existed.
+    const db = emptyDb();
+
+    const spent = mintInvite(db, "Usada");
+    assert.equal(redeem(db, USER_A, spent.code).ok, true);
+    const expired = mintInvite(db, "Vencida");
+    expireInvite(db, expired.id);
+    const revoked = mintInvite(db, "Cancelada");
+    ok(db, "auth", "revoke-invite", String(revoked.id));
+
+    const codes = [spent.code, expired.code, revoked.code, "7K2M-QX9P-4TVB"];
+    const errors = codes.map((code, i) => redeem(db, `33300000${i}`, code).error);
+    for (const error of errors) {
+      assert.equal(error, "Código incorreto.", `distinguishable answer: ${error}`);
+    }
+    // And the same thing the shared-code path says for a plain wrong guess.
+    assert.equal(errors[0], redeem(db, "334000000", "chute").error);
+  });
+
+  test("a wrong invite code feeds the existing lockout, not a second one", () => {
+    const db = emptyDb();
+    const { code, id } = mintInvite(db, "Namorada");
+
+    for (let i = 0; i < 4; i++) {
+      assert.match(redeem(db, USER_A, `AAAA-BBBB-CCC${i}`).error!, /Código incorreto/);
+    }
+    assert.match(redeem(db, USER_A, "AAAA-BBBB-CCCH").error!, /Bloqueei as tentativas/);
+    // Even the real code is refused while the lock stands: one lockout, both ways in.
+    assert.match(redeem(db, USER_A, code).error!, /Bloqueei as tentativas/);
+    assert.equal(ok(db, "auth", "status", "--user", USER_A).locked, true);
+    // And none of that consumed the invite.
+    assert.equal(inviteList(ok(db, "auth", "invites"))[0].status, "pending");
+
+    ok(db, "auth", "unlock", "--user", USER_A);
+    const r = redeem(db, USER_A, code);
+    assert.equal(r.ok, true, r.error);
+    assert.equal(r.invite_id, id);
+  });
+
+  test("two simultaneous redemptions of one invite yield exactly one success", () => {
+    // The reason `redeemInvite` is one transaction with a conditional UPDATE. Both
+    // processes are started before either can finish, from one shell.
+    const db = emptyDb();
+    const { code } = mintInvite(db, "Corrida");
+    const dir = dirname(db);
+    const outA = join(dir, "race-a.json");
+    const outB = join(dir, "race-b.json");
+    const attempt = (user: string, out: string) =>
+      `${process.execPath} ${CLI} --db ${db} auth login --user ${user}` +
+      ` --code ${code} > ${out} 2>&1`;
+
+    const proc = spawnSync(
+      "/bin/sh",
+      ["-c", `${attempt(USER_A, outA)} & ${attempt(USER_B, outB)} & wait`],
+      { encoding: "utf8", env: { ...process.env, TALLY_ACCESS_CODE: CODE } },
+    );
+    assert.equal(proc.status, 0, proc.stderr);
+
+    const results = [outA, outB].map(
+      (file) => JSON.parse(readFileSync(file, "utf8")) as Response,
+    );
+    const winners = results.filter((r) => r.ok);
+    const losers = results.filter((r) => !r.ok);
+    assert.equal(winners.length, 1, `both redemptions succeeded: ${JSON.stringify(results)}`);
+    assert.equal(winners[0].via, "invite");
+    // The loser is told what is true by then: that code is spent.
+    assert.equal(losers[0].error, "Código incorreto.");
+
+    // One person registered, and the invite records that same one. The loser's
+    // registration was rolled back with the failed consume.
+    assert.equal(ok(db, "auth", "users").count, 1);
+    const listed = inviteList(ok(db, "auth", "invites"))[0];
+    assert.equal(listed.status, "redeemed");
+    assert.equal(
+      listed.redeemed_by,
+      (winners[0].user as { telegram_user_id: string }).telegram_user_id,
+    );
+  });
+
+  test("an invite code appears once, when it is minted, and never again", () => {
+    const db = emptyDb();
+    const minted = ok(db, "auth", "invite", "--label", "Namorada");
+    const code = minted.code as string;
+    // The mint is the one place it is allowed to be, message included.
+    assert.ok((minted.message as string).includes(code));
+
+    const bare = code.replaceAll("-", "");
+    const outputs = [
+      ok(db, "auth", "invites"),
+      run(db, "auth", "login", "--user", USER_A, "--code", code),
+      ok(db, "auth", "invites"),
+      ok(db, "auth", "users"),
+      ok(db, "auth", "status"),
+      ok(db, "auth", "status", "--user", USER_A),
+      // Spent, and then a stray guess: the failure paths are where a value escapes.
+      run(db, "auth", "login", "--user", USER_B, "--code", code),
+      run(db, "auth", "login", "--user", USER_B, "--code", bare.toLowerCase()),
+      ok(db, "balance", "--user", USER_A),
+      ok(db, "auth", "revoke", "--user", USER_A),
+    ];
+    for (const r of outputs) {
+      const text = `${JSON.stringify(r)}\n${r._stderr}`;
+      assert.ok(!text.includes(code), `the code leaked into: ${text.slice(0, 200)}`);
+      assert.ok(!text.includes(bare), `the bare code leaked into: ${text.slice(0, 200)}`);
+      // Not the hash either: it is not the code, but it is nobody's business.
+      assert.ok(!text.includes("code_hash"), "the hash leaked");
+    }
+  });
+
+  test("minting, listing and revoking are refused inside a chat turn", () => {
+    // The essential one. A bot that can mint an invite is a bot that invites
+    // whoever asks it to.
+    const db = sharedDb();
+    const { id } = mintInvite(db, "Namorada");
+    const session = { HERMES_SESSION_USER_ID: USER_A, HERMES_SESSION_CHAT_TYPE: "dm" };
+
+    for (const args of [
+      ["auth", "invite", "--label", "Eu mesmo"],
+      ["auth", "invites"],
+      ["auth", "revoke-invite", String(id)],
+      ["auth", "revoke", "--user", USER_A],
+    ]) {
+      const r = spawn(db, args, session);
+      assert.equal(r.ok, false, `${args.join(" ")} ran from inside a session`);
+      assert.match(r.error!, /operador/);
+      assert.equal(r.code, undefined, "a code came back to a chat turn");
+      assert.ok(!JSON.stringify(r).includes(USER_B), "the other person leaked anyway");
+    }
+
+    // Nothing happened: the invite is untouched and both people still work.
+    assert.equal(inviteList(ok(db, "auth", "invites"))[0].status, "pending");
+    assert.equal(spawn(db, ["balance"], session).ok, true);
+    assert.equal(ok(db, "balance", "--user", USER_B).ok, true);
+  });
+
+  test("the private-chat fallback also counts as a chat turn here", () => {
+    const db = freshDb();
+    const r = spawn(db, ["auth", "invite", "--label", "Eu mesmo"], {
+      HERMES_SESSION_USER_ID: undefined,
+      HERMES_SESSION_CHAT_ID: USER_A,
+      HERMES_SESSION_CHAT_TYPE: "dm",
+    });
+    assert.equal(r.ok, false);
+    assert.match(r.error!, /operador/);
+  });
+
+  test("the shared code still works, and invites do not disturb it", () => {
+    // Backward compatibility is the requirement: a documented, working install
+    // must keep working. Both modes coexist.
+    const db = emptyDb();
+    const { code } = mintInvite(db, "Namorada");
+
+    const shared = redeem(db, USER_A, CODE);
+    assert.equal(shared.ok, true, shared.error);
+    assert.equal(shared.via, "shared_code");
+    assert.equal(shared.invite_id, null);
+    // The pending invite was not consumed by somebody else's shared-code login.
+    assert.equal(inviteList(ok(db, "auth", "invites"))[0].status, "pending");
+    assert.equal(redeem(db, USER_B, code).ok, true);
+  });
+
+  test("with TALLY_ACCESS_CODE deleted, invites are the only way in", () => {
+    // The prize: once everybody is registered the variable goes away, and no
+    // standing secret is left for `env` to print.
+    const db = emptyDb();
+    const { code } = mintInvite(db, "Namorada");
+    const noShared = { TALLY_ACCESS_CODE: undefined };
+
+    const r = spawn(db, ["auth", "login", "--user", USER_A, "--code", code], noShared);
+    assert.equal(r.ok, true, r.error);
+
+    // The old shared code buys nothing, and says nothing about there having been
+    // one: it is a wrong code, not a misconfigured server.
+    const stale = spawn(db, ["auth", "login", "--user", USER_B, "--code", CODE], noShared);
+    assert.equal(stale.ok, false);
+    assert.equal(stale.error, "Código incorreto.");
+  });
+
+  test("no shared code and no invite is the only unconfigured install", () => {
+    const db = emptyDb();
+    const r = spawn(db, ["auth", "login", "--user", USER_A, "--code", "x"], {
+      TALLY_ACCESS_CODE: undefined,
+    });
+    assert.equal(r.ok, false);
+    assert.match(r.error!, /não foi configurado/);
+  });
+
+  test("--hours sets the expiry and is bounded", () => {
+    const db = emptyDb();
+    const short = ok(db, "auth", "invite", "--label", "Curta", "--hours", "1");
+    const invite = short.invite as { created_at: string; expires_at: string };
+    assert.equal(short.hours, 1);
+    assert.ok(invite.expires_at > invite.created_at);
+    assert.equal(ok(db, "auth", "invite", "--label", "Padrão").hours, 48);
+
+    assert.match(fails(db, "auth", "invite", "--label", "X", "--hours", "0"), /--hours/);
+    assert.match(fails(db, "auth", "invite", "--label", "X", "--hours", "99999"), /--hours/);
+    assert.match(fails(db, "auth", "invite", "--label", "X", "--hours", "abc"), /--hours/);
+  });
+
+  test("an invite says who it is for", () => {
+    assert.match(fails(emptyDb(), "auth", "invite"), /--label/);
+  });
+
+  test("auth invites derives the status of every one of them", () => {
+    const db = emptyDb();
+    const pending = mintInvite(db, "Pendente");
+    const spent = mintInvite(db, "Usada");
+    const expired = mintInvite(db, "Vencida");
+    const revoked = mintInvite(db, "Cancelada");
+    redeem(db, USER_A, spent.code);
+    expireInvite(db, expired.id);
+    ok(db, "auth", "revoke-invite", String(revoked.id));
+
+    const r = ok(db, "auth", "invites");
+    assert.equal(r.count, 4);
+    assert.equal(r.pending, 1);
+    const byId = new Map(inviteList(r).map((i) => [i.id, i]));
+    assert.equal(byId.get(pending.id)!.status, "pending");
+    assert.equal(byId.get(spent.id)!.status, "redeemed");
+    assert.equal(byId.get(expired.id)!.status, "expired");
+    assert.equal(byId.get(revoked.id)!.status, "revoked");
+    assert.equal(byId.get(spent.id)!.redeemed_by, USER_A);
+    assert.equal(byId.get(pending.id)!.redeemed_by, null);
+  });
+
+  test("revoking a spent invite is refused, and points at the right command", () => {
+    // Because it would look like it removed somebody's access, and it would not.
+    const db = emptyDb();
+    const { code, id } = mintInvite(db, "Usada");
+    redeem(db, USER_A, code);
+    const error = fails(db, "auth", "revoke-invite", String(id));
+    assert.match(error, /já foi usado/);
+    assert.match(error, /auth revoke --user/);
+    assert.equal(ok(db, "balance", "--user", USER_A).ok, true);
+  });
+
+  test("revoke-invite needs a real invite number", () => {
+    const db = emptyDb();
+    assert.match(fails(db, "auth", "revoke-invite"), /convite/);
+    assert.match(fails(db, "auth", "revoke-invite", "abc"), /convite/);
+    assert.match(fails(db, "auth", "revoke-invite", "99"), /#99/);
+  });
+});
+
+describe("revoking one person", () => {
+  test("one person out, the other untouched, and no data deleted", () => {
+    const db = sharedDb();
+    ok(db, "add", "--amount", "100", "--description", "Mercado dele");
+    ok(db, "add", "--amount", "40", "--description", "Bar dela", "--user", USER_B);
+
+    const r = ok(db, "auth", "revoke", "--user", USER_A);
+    assert.equal(r.telegram_user_id, USER_A);
+    assert.equal(r.was_current, true);
+    // The promise: the ledger is still theirs.
+    assert.equal(r.transactions_preserved, 1);
+
+    // Refused from the next command on, with the answer an unknown id gets.
+    const revoked = run(db, "balance", "--user", USER_A);
+    assert.equal(revoked.ok, false);
+    assert.equal(revoked.auth_required, true);
+    assert.equal(revoked.error, run(db, "balance", "--user", "888888888").error);
+    assert.equal((ok(db, "auth", "status", "--user", USER_A).user as { active: boolean }).active, false);
+
+    // The scalpel, not the panic button: nobody else noticed.
+    assert.equal(ok(db, "ls", "--period", "all", "--user", USER_B).total_count, 1);
+    assert.equal(ok(db, "auth", "status", "--user", USER_B).current, true);
+    assert.equal(ok(db, "auth", "status").auth_epoch, 0);
+
+    // And the data is all there when they come back through a new invite.
+    const { code } = mintInvite(db, "Ele de volta");
+    const back = redeem(db, USER_A, code);
+    assert.equal(back.ok, true, back.error);
+    assert.equal(back.new_user, false);
+    assert.equal(ok(db, "ls", "--period", "all", "--user", USER_A).total_count, 1);
+  });
+
+  test("a revoked user is refused by every data subcommand", () => {
+    const db = freshDb();
+    ok(db, "auth", "revoke", "--user", USER_A);
+    for (const args of [
+      ["add", "--amount", "10", "--description", "x"],
+      ["ls"],
+      ["balance"],
+      ["summary"],
+      ["report"],
+      ["budget", "status"],
+      ["account", "list"],
+      ["category", "list"],
+      ["recurring", "list"],
+      ["goal", "list"],
+      ["export"],
+    ]) {
+      const r = run(db, ...args, "--user", USER_A);
+      assert.equal(r.ok, false, `${args[0]} let a revoked user through`);
+      assert.equal(r.auth_required, true, `${args[0]} did not ask for a code`);
+    }
+  });
+
+  test("revoke says so when the shared code would let them straight back in", () => {
+    // Honest reporting: with TALLY_ACCESS_CODE still in the environment, this
+    // person types it and is back. The revocation only becomes final when the
+    // shared code is gone.
+    const db = freshDb();
+    const withShared = ok(db, "auth", "revoke", "--user", USER_A);
+    assert.equal(withShared.shared_code_active, true);
+    assert.match(withShared.message as string, /TALLY_ACCESS_CODE/);
+    assert.equal(redeem(db, USER_A, CODE).ok, true);
+
+    // With no shared code, there is nothing to warn about.
+    const invited = emptyDb();
+    const { code } = mintInvite(invited, "Namorada");
+    spawn(invited, ["auth", "login", "--user", USER_A, "--code", code], {
+      TALLY_ACCESS_CODE: undefined,
+    });
+    const clean = spawn(invited, ["auth", "revoke", "--user", USER_A], {
+      TALLY_ACCESS_CODE: undefined,
+    });
+    assert.equal(clean.ok, true, clean.error);
+    assert.equal(clean.shared_code_active, false);
+    assert.ok(!(clean.message as string).includes("TALLY_ACCESS_CODE"));
+  });
+
+  test("logout-all is still the everybody version, and revoke is not", () => {
+    const db = sharedDb();
+    ok(db, "auth", "revoke", "--user", USER_A);
+    // One session left, and `logout-all` still ends it.
+    const out = ok(db, "auth", "logout-all");
+    assert.equal(out.sessions_invalidated, 1);
+    assert.equal(run(db, "balance", "--user", USER_B).auth_required, true);
+  });
+
+  test("auth revoke needs to be told who, and refuses a stranger", () => {
+    const db = freshDb();
+    assert.match(fails(db, "auth", "revoke"), /--user/);
+    assert.match(fails(db, "auth", "revoke", "--user", "999999999"), /Não achei ninguém/);
+    assert.match(fails(db, "auth", "revoke", "--user", "legacy"), /legacy/);
+    // Nobody was cut off by any of that.
+    assert.equal(ok(db, "balance", "--user", USER_A).ok, true);
   });
 });
 

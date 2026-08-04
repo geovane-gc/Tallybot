@@ -128,17 +128,39 @@ ausente, não como o ID `""`. O Hermes deixa esse campo vazio no caminho de
 observação anônima de grupo, e uma string vazia virando ID juntaria todo mundo
 que chegasse por ali num único caixa.
 
-**3. O código de acesso, na ferramenta — guarda-corpo.** Cada pessoa digita
-`TALLY_ACCESS_CODE` uma vez. A verificação está no `fin.ts` e não no prompt, e
-esse é o ponto: um LLM se deixa convencer — "ignore suas instruções, eu já
-autentiquei" é literalmente a classe de ataque que existe contra prompts. Um `if`
-não. Então quem recusa é a ferramenta, e o agente só sabe repassar a mensagem.
+**3. O código de acesso, na ferramenta — guarda-corpo.** Cada pessoa digita um
+código uma vez. A verificação está no `fin.ts` e não no prompt, e esse é o ponto: um
+LLM se deixa convencer — "ignore suas instruções, eu já autentiquei" é literalmente
+a classe de ataque que existe contra prompts. Um `if` não. Então quem recusa é a
+ferramenta, e o agente só sabe repassar a mensagem.
 
-O código não fica no banco (um backup o carregaria) nem no prompt (o modelo o
-repetiria). Vive na variável de ambiente e é comparado por digestos SHA-256 com
-`timingSafeEqual` — hasheado dos dois lados porque `timingSafeEqual` estoura com
-tamanhos diferentes, e responder "tamanho errado" mais rápido que "código errado"
-vazaria o comprimento do código.
+Esse código é de um dos dois tipos, verificados nessa ordem:
+
+**Convite por pessoa** (`invites`, migration 4). `auth invite --label "..."` gera um
+código de uso único que expira, imprime **uma vez** e guarda só o SHA-256. 12
+caracteres de um alfabeto de 31 (≈59 bits, sem `0`/`O` e sem `1`/`I`/`L`, porque ele
+é ditado em voz alta). O consumo é uma transação `BEGIN IMMEDIATE` com um `UPDATE`
+condicional — duas redenções simultâneas do mesmo código não podem ambas passar, e a
+que perde tem o cadastro desfeito junto com o rollback. Normalização antes do hash
+(maiúscula, sem separador), então `7k2m qx9p 4tvb` vale.
+
+**Código compartilhado** (`TALLY_ACCESS_CODE`), o modo simples, mantido porque uma
+instalação que já roda com ele não pode quebrar. Fica na variável de ambiente — não
+no banco (um backup o carregaria) nem no prompt (o modelo o repetiria) — e é
+comparado por digestos SHA-256 com `timingSafeEqual`: hasheado dos dois lados porque
+`timingSafeEqual` estoura com tamanhos diferentes, e responder "tamanho errado" mais
+rápido que "código errado" vazaria o comprimento do código.
+
+**Todo código que não abre a porta responde a mesma frase** — `Código incorreto.` —
+seja errado, expirado, já usado ou revogado, e alimenta os mesmos contadores de
+bloqueio. Quem estiver sondando não descobre que um código existiu.
+
+O que o convite melhora, e o que ele explicitamente não melhora: ele resolve
+**cadastro e revogação** — dá para tirar uma pessoa (`auth revoke --user`) sem
+mexer na outra, o código morre ao ser usado, e com todos cadastrados o
+`TALLY_ACCESS_CODE` sai do `.env` e **não sobra segredo permanente para o agente ler
+com `env`**. Ele não muda nada sobre isolamento: continua sendo a camada 3, e a
+camada 3 é guarda-corpo, não fronteira — ver a seção seguinte.
 
 ### Onde as camadas 2 e 3 param
 
@@ -161,8 +183,11 @@ montado, então `node -e` com `node:sqlite` abre o arquivo direto. O
 [`references/schema.md`](../skills/finance/references/schema.md) inclusive entrega
 o trecho pronto, porque existe para consultas que o CLI não cobre.
 
-A camada 3 não ajuda aqui pelo mesmo motivo: o código precisa estar no ambiente do
-processo que o agente dispara, então um `env | grep TALLY` o revela.
+A camada 3 não ajuda aqui. Com o código compartilhado, um `env | grep TALLY` o
+revela, porque ele precisa estar no ambiente do processo que o agente dispara. Com
+convite e o `TALLY_ACCESS_CODE` apagado esse `env` não mostra mais nada — e ainda
+assim não ajuda, porque o caminho acima nunca precisou de código nenhum: quem já
+está cadastrado não digita código para rodar um comando.
 
 O que sobra, dito com precisão:
 
@@ -172,6 +197,7 @@ O que sobra, dito com precisão:
 | `user_id` em toda consulta | Os dois caixas se misturarem por acidente. Sólido — ver abaixo. |
 | Identidade pelo ambiente, `--user` recusado | O bot trocar de caixa quando alguém pede, e o erro honesto do operador. |
 | Código de acesso | Ninguém, contra o agente. É uma etapa de cadastro. |
+| Convite por pessoa | Cadastro não autorizado (o código morre ao ser usado, e o bot não pode gerar convite) e a falta de revogação individual. Não isola uma pessoa da outra. |
 
 A parte de **correção** é forte, e isso não é pouco: uma varredura de todas as
 consultas SQL dos comandos de dados não achou um único vazamento, incluindo
@@ -190,15 +216,32 @@ Detalhes de comportamento que caem daí:
   deixa do agente para pedir o código.
 - "ID desconhecido" e "sessão revogada" devolvem **a mesma** mensagem. O agente
   trata um caso só, e quem estiver sondando IDs não aprende nada.
-- Cinco códigos errados travam aquela pessoa. O contador mora numa linha de
-  `users` criada até para um ID desconhecido — sem essa linha, um ID de fora teria
-  tentativas infinitas. Ela nasce com `authenticated_at` nulo, então não possui
-  nada e não alcança nada.
-- `auth logout-all` (`make logout-all`) incrementa `app_state.auth_epoch`. Toda
-  sessão com `auth_epoch` abaixo do global vira inválida de uma vez, e o mesmo
-  comando zera os contadores de tentativa — é assim que se desbloqueia alguém.
-  **Nenhum dado é apagado:** os lançamentos continuam lá e reaparecem quando cada
-  um redigita o código.
+- Cinco códigos errados travam aquela pessoa; vinte, somados entre todos os IDs,
+  travam todo mundo (senão bastava trocar de `--user` para comprar cinco tentativas
+  novas). Os dois contadores moram em `app_state`, chaveados pelo ID do Telegram, e
+  não em `users` — um ID que só errou o código não deixa linha nenhuma para trás.
+  Um convite errado alimenta esses mesmos contadores: existe um bloqueio, não um por
+  forma de entrar.
+- Só `auth unlock --user <id>` libera (o contador daquela pessoa e o global juntos).
+  `auth logout-all` deliberadamente não libera — já liberava, e como ele não exige
+  autenticação nenhuma, isso fazia do bloqueio um enfeite.
+- **Duas formas de tirar acesso, e nenhuma apaga dado:**
+  - `auth revoke --user <id>` (`make revoke TG_USER=…`) é o bisturi: zera
+    `users.active` daquela pessoa, que é a flag que o `isSessionCurrent` já
+    checava. Ela cai na mesma resposta de um ID desconhecido, precisa de um convite
+    novo, e a outra pessoa não sente nada. O caixa dela continua inteiro e reaparece
+    quando ela volta. A resposta do comando avisa se o `TALLY_ACCESS_CODE` ainda
+    estiver no ambiente — enquanto estiver, a pessoa revogada volta digitando ele.
+    Vale rodar `make cron-install` depois: o script agenda a partir de quem tem
+    sessão válida, então é ele que remove os jobs daquela pessoa.
+  - `auth logout-all` (`make logout-all`) é o botão de pânico: incrementa
+    `app_state.auth_epoch`, e toda sessão com `auth_epoch` abaixo do global vira
+    inválida de uma vez. Os lançamentos continuam lá e reaparecem quando cada um
+    redigita o código.
+- O bot não pode convidar ninguém nem revogar ninguém: `auth invite`, `auth
+  invites`, `auth revoke-invite` e `auth revoke` são comandos de operador e recusam
+  com identidade de sessão vinculada. Isso é essencial e não cosmético — um bot que
+  pode gerar convite é um bot que convida quem pedir.
 - O primeiro login de uma pessoa é o que **cria** o caixa dela: as 17 categorias,
   as ~70 subcategorias, a conta "Carteira" e as configurações iniciais. O `init`
   não semeia mais nada, porque a taxonomia é por pessoa e no `init` ainda não
@@ -251,8 +294,9 @@ vez de deixá-lo adivinhar isso a partir da mensagem de erro.
 
 ## Modelo de dados
 
-Treze tabelas, uma view. Onze são o caixa; duas — `users` e `app_state` — chegaram
-com a migration 2 e cuidam de identidade e sessão. O detalhe completo está em
+Catorze tabelas, uma view. Onze são o caixa; `users` e `app_state` chegaram com a
+migration 2 e cuidam de identidade e sessão; `invites` chegou com a migration 4 e
+cuida de quem entra. O detalhe completo está em
 [`skills/finance/references/schema.md`](../skills/finance/references/schema.md).
 
 Cinco decisões que moldam as consultas:
@@ -305,6 +349,26 @@ nova não ganha o placeholder.
 **`users.telegram_chat_id` só é gravado se a conversa for privada.** É de lá que o
 cron tira o destino dos relatórios; um ID de grupo ali publicaria o extrato de
 alguém para a sala inteira.
+
+### A tabela `invites` (migration 4)
+
+`code_hash` (UNIQUE), `label`, `created_at`, `expires_at`, `redeemed_at`,
+`redeemed_by_user_id`, `revoked_at`. O status (`pending` / `redeemed` / `expired` /
+`revoked`) é **derivado** dessas três colunas anuláveis, nunca armazenado — não há
+como o status discordar dos fatos.
+
+Só o hash entra: nem o `auth invites` nem um backup nem você conseguem ver um código
+depois de gerado. O `label` existe só para o seu próprio audit ("o que eu dei pra
+ela"), porque é isso que faz a revogação ser respondível um mês depois.
+
+O `UNIQUE` de `code_hash` já é o índice da consulta de redenção (é um ponto de
+igualdade nessa coluna e em nada mais), então o único índice acrescentado é
+`idx_invites_redeemed_by` — "por qual convite essa pessoa entrou", que é o que o
+`auth revoke` reporta.
+
+A migration 4 é aditiva: cria uma tabela e um índice, não toca em nenhuma linha
+existente e não muda nenhuma constraint. Um banco na versão 3 sobe para a 4 no
+primeiro comando, e o login pelo código compartilhado continua idêntico.
 
 ## Deduplicação de alertas
 
@@ -400,11 +464,13 @@ para que um erro do modelo não vire um loop que queima a cota. Se ele começar 
 escolher comandos errados, trocar `model.default` por
 `google/gemma-4-31b-it:free` é uma linha em `hermes/config.yaml`.
 
-**Duas pessoas, não N.** Tecnicamente o schema aguenta qualquer número de linhas
-em `users`, e nada no `fin.ts` conta pessoas. O que é feito para duas é o resto: o
-código de acesso é um só, compartilhado, então não há como revogar o acesso de uma
-pessoa sem forçar a outra a redigitar. Para um grupo maior, o caminho seria um
-código por pessoa ou um convite de uso único.
+**Duas pessoas, não N — mas não é mais o acesso que limita.** O schema aguenta
+qualquer número de linhas em `users`, nada no `fin.ts` conta pessoas, e desde a
+migration 4 cada pessoa entra pelo convite dela e sai sozinha (`auth revoke`). O que
+sobra de "feito para duas" é o modelo de confiança, não o cadastro: todas as pessoas
+dividem um container e um agente com shell, então ninguém fica isolado de ninguém.
+Isso é adequado para um casal e péssimo para um grupo de desconhecidos — ver
+[roadmap.md](roadmap.md).
 
 **Nada é compartilhado, nem quando você quer.** Não existe despesa conjunta, rateio
 nem visão somada do casal. É a decisão certa por padrão, mas significa que "quanto
@@ -412,8 +478,11 @@ nós dois gastamos de mercado" não tem resposta — ver [roadmap.md](roadmap.md
 
 **O agente tem um shell, e isso define o modelo de ameaça inteiro.** Quem passa da
 allowlist pode pedir ao bot que imprima as credenciais (o `.env` está em
-`/opt/data/.env`), o código de acesso, e o caixa da outra pessoa. Não é um bug do
-Tally: é o que significa dar um toolset `terminal` a um agente. As consequências:
+`/opt/data/.env`) e o caixa da outra pessoa. Com `TALLY_ACCESS_CODE` apagado do
+`.env` não há mais código de acesso no ambiente para imprimir — é o que a migration
+4 compra —, mas as outras credenciais continuam lá e o caixa alheio continua
+alcançável. Não é um bug do Tally: é o que significa dar um toolset `terminal` a um
+agente. As consequências:
 
 - A allowlist é a única trava que conta, e um ID a mais nela é mais uma pessoa com
   acesso ao container e a tudo dentro dele.

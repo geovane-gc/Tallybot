@@ -17,9 +17,23 @@ Tally: ✅ Tudo certo, agora é só me contar seus gastos.
 
 É uma vez só. Depois disso ele não pergunta mais.
 
-Cinco tentativas erradas travam o acesso, e aí só o dono do servidor libera (com
-`make logout-all`). Se o bot voltar a pedir o código do nada, foi esse comando
-que rodou — é só digitar de novo, nada foi perdido.
+O código pode ser um **convite seu** (que o Geovane te ditou; serve uma vez e
+expira) ou o código compartilhado — para você é a mesma coisa, é só digitar. Não
+precisa acertar maiúscula nem traço: `7k2m qx9p 4tvb` funciona igual a
+`7K2M-QX9P-4TVB`.
+
+Se não funcionar, a resposta é sempre `Código incorreto.` — o bot não sabe (e não
+vai chutar) se foi código errado, convite expirado ou convite já usado. Pede outro
+para o Geovane.
+
+Cinco tentativas erradas travam o acesso, e aí só o dono do servidor libera. Se o bot
+voltar a pedir o código do nada, foi porque ele encerrou as sessões de todo mundo
+(`make logout-all`) ou revogou o seu acesso (`make revoke`). Nos dois casos **nada
+foi apagado**: no primeiro é só digitar de novo, no segundo você precisa de um
+convite novo.
+
+O bot não cria convite e não adiciona ninguém — nem se você pedir. Isso é só no
+terminal do Geovane.
 
 O bot nunca repete nem confirma o código. Se você perguntar qual é, ele diz que
 não tem.

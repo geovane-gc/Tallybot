@@ -32,7 +32,8 @@ $EDITOR .env          # as mesmas variáveis do setup local
 make up
 ```
 
-Aí as duas pessoas mandam mensagem ao bot e digitam o código de acesso. **Só
+Aí você gera um convite por pessoa (`make invite LABEL="Namorada"`, que imprime o
+código uma única vez), as duas mandam mensagem ao bot e digitam o dela. **Só
 depois:**
 
 ```bash
@@ -152,7 +153,7 @@ webhook, o que combina com plataformas que hibernam a máquina:
 fly launch --image nousresearch/hermes-agent:latest --no-deploy
 fly volumes create hermes_data --size 3
 fly secrets set OPENROUTER_API_KEY=... TELEGRAM_BOT_TOKEN=... \
-                TELEGRAM_ALLOWED_USERS=... TALLY_ACCESS_CODE=... \
+                TELEGRAM_ALLOWED_USERS=... \
                 TELEGRAM_WEBHOOK_URL=https://SEU-APP.fly.dev/telegram \
                 TELEGRAM_WEBHOOK_SECRET=$(openssl rand -hex 32) \
                 HERMES_DASHBOARD=0
@@ -166,6 +167,11 @@ real de qualquer um que descubra a URL. Gere com `openssl rand -hex 32`.
 **`HERMES_DASHBOARD=0`** porque aqui não existe o `127.0.0.1` do compose para
 proteger você: no Fly, o que estiver escutando pode acabar publicado, e o
 dashboard mostra as chaves de API.
+
+Sem `TALLY_ACCESS_CODE` na lista de propósito: cadastre as pessoas por convite
+(`fly ssh console -C "node /opt/data/skills/finance/scripts/fin.ts auth invite
+--label 'Namorada'"`), e nenhum código de acesso precisa virar secret. Se preferir o
+modo simples, acrescente `TALLY_ACCESS_CODE=...` aí.
 
 No `fly.toml`, monte o volume em `/opt/data` e use `command = ["gateway", "run"]`.
 
@@ -193,12 +199,17 @@ A consequência prática é a que importa:
 - `TELEGRAM_ALLOWED_USERS` é a **única** trava de verdade. O Hermes valida no
   gateway, antes de o modelo rodar, e sem allowlist nega todo mundo (fail-closed).
   Tudo o mais está dentro do raio de alcance de quem está na lista — inclusive o
-  código de acesso, que o agente lê no próprio ambiente com `env`.
+  `TALLY_ACCESS_CODE`, que o agente lê no próprio ambiente com `env`. É por isso que
+  vale cadastrar todo mundo por convite (`make invite LABEL="..."`) e **apagar essa
+  variável do `.env` depois**: convite não fica no ambiente e o banco guarda só o
+  hash dele, então não sobra segredo permanente para o agente imprimir.
 - **Nunca ligue `GATEWAY_ALLOW_ALL_USERS`.**
 - Só coloque na lista alguém em quem você confia no nível de "tem acesso a este
   container". Não existe ali um nível "só pode registrar gastos".
 - Se você suspeitar de acesso indevido: `/revoke` no @BotFather, chave nova na
-  OpenRouter, código de acesso novo e `make logout-all`.
+  OpenRouter e `make logout-all` (todos redigitam). Se a suspeita é de uma pessoa
+  específica, `make revoke TG_USER=<id>` tira só ela, sem apagar dado nenhum — e
+  aí apague o `TALLY_ACCESS_CODE`, senão ela volta digitando ele.
 
 ### As duas pessoas não estão isoladas uma da outra
 
@@ -282,12 +293,19 @@ force `HERMES_DASHBOARD=0`.
   deixaria um `.env.bak` com as credenciais dentro.
 - O bootstrap aplica `chmod 600` no `.env` **a cada execução**, não só na criação,
   e copia para `data/.env` também com `600`.
-- **O código de acesso não está no banco** — vive em `TALLY_ACCESS_CODE` e é
-  comparado por digestos SHA-256 com `timingSafeEqual`. Um backup do banco não o
-  carrega.
+- **Nenhum código de acesso está no banco em texto claro.** O compartilhado vive em
+  `TALLY_ACCESS_CODE` e é comparado por digestos SHA-256 com `timingSafeEqual`; de um
+  convite o banco guarda só o SHA-256, e o código em si aparece uma única vez, na
+  saída do `make invite`. Um backup não carrega nenhum dos dois.
+- **O melhor estado é sem `TALLY_ACCESS_CODE` nenhum.** Depois que todas as pessoas
+  entraram por convite, apague a variável do `.env` e `make restart`: ninguém é
+  desconectado (a sessão está no banco) e passa a não existir segredo permanente no
+  ambiente do container. O bootstrap aceita a variável vazia — ele só reclama se
+  ninguém puder entrar.
 - Trocar o valor de `TALLY_ACCESS_CODE` **não** desconecta ninguém: quem já está
-  dentro continua dentro. Para forçar todo mundo a digitar de novo,
-  `make logout-all` — que não apaga nenhum lançamento.
+  dentro continua dentro. Para tirar uma pessoa, `make revoke TG_USER=<id>`; para
+  forçar todo mundo a digitar de novo, `make logout-all`. Nenhum dos dois apaga um
+  lançamento.
 
 **Se o token do bot vazar**, mande `/revoke` para o @BotFather, gere outro e
 atualize o `.env`. Quem tem o token controla o bot.

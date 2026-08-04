@@ -23,6 +23,13 @@
  *   because a silent default is exactly how one person ends up seeing the
  *   other's balance.
  *
+ * - Getting in is a per-person invite: a single-use code the owner mints in the
+ *   terminal and dictates in person, of which only the SHA-256 is stored. The
+ *   shared `TALLY_ACCESS_CODE` still works as the simple mode, and once everybody
+ *   has redeemed an invite it can be deleted from the environment, leaving no
+ *   standing secret anywhere. Cutting one person off is `auth revoke --user`,
+ *   which flips `users.active` and touches nobody else. See migration 4.
+ *
  * - A transaction is either `paid` or `pending`. `paid` is the default and covers
  *   everything typed into the chat: you log an expense once the money is gone.
  *   `pending` exists for a generated fixed cost that is due but not settled yet —
@@ -48,7 +55,7 @@
 
 import { DatabaseSync } from "node:sqlite";
 import { mkdirSync } from "node:fs";
-import { createHash, timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { dirname, resolve } from "node:path";
 
 export type Cents = number & { readonly __brand: unique symbol };
@@ -84,7 +91,7 @@ export const ACCOUNT_TYPES: readonly AccountType[] = [
 
 export const DEFAULT_DB = process.env.TALLY_DB ?? "/opt/data/finance/tally.db";
 
-export const CURRENT_SCHEMA_VERSION = 3;
+export const CURRENT_SCHEMA_VERSION = 4;
 
 const TZ = "America/Sao_Paulo";
 
@@ -144,8 +151,15 @@ export function today(): string {
   }).format(new Date());
 }
 
-/** ISO timestamp with the São Paulo offset, for the audit columns. */
-export function now(): string {
+/**
+ * One instant as an ISO timestamp with the São Paulo offset.
+ *
+ * Every audit column in this schema holds this exact shape, and because the
+ * offset is always the same literal `-03:00` (Brazil dropped DST in 2019), two of
+ * these strings compare as timestamps with `<`. `invites.expires_at` relies on
+ * that, in SQL and in TypeScript.
+ */
+function formatTimestamp(at: Date): string {
   const parts = new Intl.DateTimeFormat("en-CA", {
     timeZone: TZ,
     year: "numeric",
@@ -155,9 +169,19 @@ export function now(): string {
     minute: "2-digit",
     second: "2-digit",
     hour12: false,
-  }).formatToParts(new Date());
+  }).formatToParts(at);
   const p = (t: string) => parts.find((x) => x.type === t)!.value;
   return `${p("year")}-${p("month")}-${p("day")}T${p("hour")}:${p("minute")}:${p("second")}-03:00`;
+}
+
+/** ISO timestamp with the São Paulo offset, for the audit columns. */
+export function now(): string {
+  return formatTimestamp(new Date());
+}
+
+/** The same timestamp, N hours later. Used for an invite's expiry. */
+export function addHours(timestamp: string, hours: number): string {
+  return formatTimestamp(new Date(new Date(timestamp).getTime() + hours * 3_600_000));
 }
 
 interface Ymd {
@@ -1007,6 +1031,52 @@ const MIGRATIONS: readonly { version: number; sql: string }[] = [
     LEFT JOIN accounts ad   ON ad.id = t.dest_account_id;
     `,
   },
+  {
+    // Per-person invites, so that letting somebody in and cutting somebody off are
+    // two different acts.
+    //
+    // Before this there was one `TALLY_ACCESS_CODE` in the environment, typed by
+    // both people and living there forever. Three problems it had: one person
+    // could not be cut off without disturbing the other, whoever knew the string
+    // could register further Telegram ids at any time, and the secret sat in the
+    // environment of a process the agent spawns — so `env` would still show it
+    // months later.
+    //
+    // An invite is single-use, expires on its own, and only its SHA-256 lands
+    // here: `auth invite` prints the code once and nothing can print it again.
+    // Once everybody has redeemed one, `TALLY_ACCESS_CODE` can be deleted and no
+    // standing secret exists anywhere.
+    //
+    // What this does NOT change: the agent has a shell and this file is a file it
+    // can open. Invites improve onboarding and revocation, not isolation — a
+    // registered person can still reach the other's ledger by asking the bot to
+    // run a command. See the header of this file.
+    version: 4,
+    sql: `
+    CREATE TABLE invites (
+        id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+        -- SHA-256 of the normalised code, never the code. UNIQUE, which is also
+        -- the index the redemption lookup rides: it is a point query on this
+        -- column and nothing else.
+        code_hash           TEXT NOT NULL UNIQUE,
+        -- Who it is for, in the owner's own words. Only he ever reads it, and it
+        -- is what makes 'revoke the one I gave to X' answerable months later.
+        label               TEXT,
+        created_at          TEXT NOT NULL,
+        expires_at          TEXT NOT NULL,
+        -- Set together, in one conditional UPDATE, and that is what makes a
+        -- second redemption of the same code impossible. See \`redeemInvite\`.
+        redeemed_at         TEXT,
+        redeemed_by_user_id INTEGER REFERENCES users(id),
+        revoked_at          TEXT
+    );
+
+    -- 'which invite did this person come in through', which is what
+    -- \`auth revoke --user\` reports. The code_hash lookup needs no index of its
+    -- own: UNIQUE above already created one.
+    CREATE INDEX idx_invites_redeemed_by ON invites(redeemed_by_user_id);
+    `,
+  },
 ];
 
 /**
@@ -1060,9 +1130,23 @@ export function connect(path?: string): Db {
   return db;
 }
 
-/** Runs `fn` inside a transaction, rolling back on error. */
-export function transaction<T>(db: Db, fn: () => T): T {
-  db.exec("BEGIN");
+/**
+ * Runs `fn` inside a transaction, rolling back on error.
+ *
+ * `mode` is `DEFERRED` (SQLite's default) unless a caller says otherwise: the
+ * write lock is taken at the first write, which is right for everything that
+ * reads its own data. `IMMEDIATE` takes the write lock at `BEGIN`, and exists for
+ * read-then-conditionally-write sequences that must not interleave — a second
+ * connection waits (up to `busy_timeout`) and then reads what the first one
+ * committed, instead of reading a stale snapshot and failing at COMMIT.
+ * `redeemInvite` is the one that needs it.
+ */
+export function transaction<T>(
+  db: Db,
+  fn: () => T,
+  mode: "DEFERRED" | "IMMEDIATE" = "DEFERRED",
+): T {
+  db.exec(mode === "IMMEDIATE" ? "BEGIN IMMEDIATE" : "BEGIN");
   try {
     const r = fn();
     db.exec("COMMIT");
@@ -1217,11 +1301,18 @@ export interface UserRow {
 export const LEGACY_TELEGRAM_ID = "legacy";
 
 /**
- * The access code both people type once, read from the environment.
+ * The shared access code, read from the environment.
  *
  * Deliberately not in the database (a backup would carry it) and not in the
  * prompt (the model would repeat it). It is never returned, logged or echoed
  * anywhere — including in this module's error messages.
+ *
+ * It is now the *fallback* mode: an invite is checked first. Keeping it is not
+ * legacy weight — a working install is documented around this variable, and the
+ * shared code stays the simple way to onboard one more person without minting
+ * anything. But it is also the standing secret invites exist to remove, so once
+ * everybody has redeemed one it can be deleted from the environment; see
+ * `sharedCodeConfigured`.
  */
 function configuredCode(): string {
   const code = process.env.TALLY_ACCESS_CODE;
@@ -1244,6 +1335,392 @@ export function verifyAccessCode(candidate: string): boolean {
   const expected = createHash("sha256").update(configuredCode(), "utf8").digest();
   const given = createHash("sha256").update(String(candidate ?? ""), "utf8").digest();
   return timingSafeEqual(given, expected);
+}
+
+/**
+ * Whether a shared access code exists in the environment at all.
+ *
+ * Its absence is the desired end state, not an error: with everybody registered
+ * through an invite, deleting `TALLY_ACCESS_CODE` leaves no standing secret for
+ * anything — including the agent's own `env` — to read. The caller uses this to
+ * decide whether "no shared code" means "not configured yet" or "on purpose".
+ */
+export function sharedCodeConfigured(): boolean {
+  const code = process.env.TALLY_ACCESS_CODE;
+  return typeof code === "string" && code.trim() !== "";
+}
+
+/* -- Invites: one code per person, single use -------------------------------- */
+
+/**
+ * The alphabet an invite code is drawn from: 31 characters.
+ *
+ * No `0`/`O` and no `1`/`I`/`L`, because this code is *dictated in person* — the
+ * whole point of an invite is that it never travels through the chat it protects.
+ * A character somebody can mishear is a support conversation, and worse, a wrong
+ * code spends one of the five attempts before the lockout.
+ */
+const INVITE_ALPHABET = "23456789ABCDEFGHJKMNPQRSTUVWXYZ";
+
+/**
+ * 12 characters, printed as `7K2M-QX9P-4TVB`.
+ *
+ * 12 × log2(31) ≈ **59 bits**, i.e. about 5.8 × 10¹⁷ codes. Guessing is hopeless
+ * twice over: the existing lockout stops everybody after 20 wrong codes in total,
+ * so an attacker gets 20 tries at a 1-in-10¹⁷ chance, and the invite expires
+ * anyway. It is short enough to read aloud and long enough that nothing about the
+ * search space matters.
+ */
+export const INVITE_CODE_LENGTH = 12;
+const INVITE_GROUP_SIZE = 4;
+
+/** Long enough to hand over in person, short enough to be worth expiring. */
+export const DEFAULT_INVITE_HOURS = 48;
+/** A year. Past this an "invite" is just a second shared code with extra steps. */
+export const MAX_INVITE_HOURS = 24 * 365;
+
+/** A fresh code, grouped for a human to read out. Never stored — only its hash. */
+export function generateInviteCode(): string {
+  // Rejection sampling. 256 is not a multiple of 31, so folding every byte with
+  // `%` would make the first nine characters of the alphabet slightly likelier;
+  // discarding the tail keeps the distribution flat. The cost is ~3% of the bytes.
+  const limit = Math.floor(256 / INVITE_ALPHABET.length) * INVITE_ALPHABET.length;
+  const chars: string[] = [];
+  while (chars.length < INVITE_CODE_LENGTH) {
+    for (const byte of randomBytes(INVITE_CODE_LENGTH)) {
+      if (byte >= limit) continue;
+      chars.push(INVITE_ALPHABET[byte % INVITE_ALPHABET.length]);
+      if (chars.length === INVITE_CODE_LENGTH) break;
+    }
+  }
+  const groups: string[] = [];
+  for (let i = 0; i < INVITE_CODE_LENGTH; i += INVITE_GROUP_SIZE) {
+    groups.push(chars.slice(i, i + INVITE_GROUP_SIZE).join(""));
+  }
+  return groups.join("-");
+}
+
+/**
+ * The form that gets hashed: upper-case, letters and digits only.
+ *
+ * Somebody who was told `7K2M-QX9P-4TVB` will type `7k2m qx9p 4tvb`, or paste it
+ * with a stray dash. All of those are the same code, so the separators and the
+ * case are dropped before hashing rather than being rejected — a person retyping
+ * a code they heard correctly must not be told they got it wrong.
+ */
+export function normalizeInviteCode(raw: string): string {
+  return String(raw ?? "")
+    .toUpperCase()
+    .replace(/[^0-9A-Z]/g, "");
+}
+
+/** SHA-256 of the normalised code, hex. The only form of a code we ever store. */
+export function hashInviteCode(raw: string): string {
+  return createHash("sha256").update(normalizeInviteCode(raw), "utf8").digest("hex");
+}
+
+export type InviteStatus = "pending" | "redeemed" | "expired" | "revoked";
+
+export interface InviteRow {
+  id: number;
+  code_hash: string;
+  label: string | null;
+  created_at: string;
+  expires_at: string;
+  redeemed_at: string | null;
+  redeemed_by_user_id: number | null;
+  revoked_at: string | null;
+}
+
+/** An invite as the operator sees it. No `code_hash`, and never the code. */
+export interface InviteView {
+  id: number;
+  label: string | null;
+  status: InviteStatus;
+  created_at: string;
+  expires_at: string;
+  redeemed_at: string | null;
+  /** The Telegram id that used it, when it was used. */
+  redeemed_by: string | null;
+  revoked_at: string | null;
+}
+
+/**
+ * The status is derived, never stored — three nullable columns already say it.
+ *
+ * `redeemed` wins over `revoked` because it records what actually happened: a
+ * redeemed invite cannot be revoked afterwards (`revokeInvite` refuses and points
+ * at `auth revoke --user`, which is the thing that removes a person's access).
+ */
+export function inviteStatus(row: InviteRow, at: string = now()): InviteStatus {
+  if (row.redeemed_at) return "redeemed";
+  if (row.revoked_at) return "revoked";
+  if (row.expires_at <= at) return "expired";
+  return "pending";
+}
+
+function inviteView(
+  row: InviteRow & { redeemed_by?: string | null },
+  at: string = now(),
+): InviteView {
+  return {
+    id: row.id,
+    label: row.label,
+    status: inviteStatus(row, at),
+    created_at: row.created_at,
+    expires_at: row.expires_at,
+    redeemed_at: row.redeemed_at,
+    redeemed_by: row.redeemed_by ?? null,
+    revoked_at: row.revoked_at,
+  };
+}
+
+export interface MintedInvite {
+  invite: InviteView;
+  /** The plaintext code. The caller prints it once; nothing can print it again. */
+  code: string;
+}
+
+/** Mints an invite, storing only its hash. */
+export function createInvite(
+  db: Db,
+  label: string | null,
+  hours: number = DEFAULT_INVITE_HOURS,
+): MintedInvite {
+  const created = now();
+  const expires = addHours(created, hours);
+
+  // A collision at 59 bits is not a thing that happens, but the column is UNIQUE
+  // and retrying costs two lines — better than surfacing a constraint error.
+  for (let attempt = 0; ; attempt++) {
+    const code = generateInviteCode();
+    try {
+      const info = db
+        .prepare(
+          "INSERT INTO invites (code_hash, label, created_at, expires_at) " +
+            "VALUES (?, ?, ?, ?)",
+        )
+        .run(hashInviteCode(code), label, created, expires);
+      const row = db
+        .prepare("SELECT * FROM invites WHERE id = ?")
+        .get(Number(info.lastInsertRowid)) as InviteRow;
+      return { invite: inviteView(row, created), code };
+    } catch (e) {
+      if (attempt >= 4) throw e;
+    }
+  }
+}
+
+/** Every invite, newest last, with the Telegram id of whoever redeemed it. */
+export function listInvites(db: Db, at: string = now()): InviteView[] {
+  const rows = db
+    .prepare(
+      "SELECT i.*, u.telegram_user_id AS redeemed_by FROM invites i " +
+        "LEFT JOIN users u ON u.id = i.redeemed_by_user_id ORDER BY i.id",
+    )
+    .all() as (InviteRow & { redeemed_by: string | null })[];
+  return rows.map((row) => inviteView(row, at));
+}
+
+export interface RevokedInvite {
+  invite: InviteView;
+  /** True when it was already revoked, so the caller can say so instead of lying. */
+  already_revoked: boolean;
+}
+
+/**
+ * Kills an invite that has not been used.
+ *
+ * Refuses a redeemed one on purpose: revoking it would look like it removed
+ * somebody's access, and it would not. That is `revokeUser`.
+ *
+ * `IMMEDIATE` for the same reason as `redeemInvite`, on the other side of the same
+ * race: the operator typing this at the very moment somebody redeems the code must
+ * not be told "revoked" about an invite that in fact got used. Whoever takes the
+ * write lock first wins, and the other one sees the truth.
+ */
+export function revokeInvite(db: Db, id: number, at: string = now()): RevokedInvite {
+  return transaction(
+    db,
+    () => {
+      const row = db
+        .prepare(
+          "SELECT i.*, u.telegram_user_id AS redeemed_by FROM invites i " +
+            "LEFT JOIN users u ON u.id = i.redeemed_by_user_id WHERE i.id = ?",
+        )
+        .get(id) as (InviteRow & { redeemed_by: string | null }) | undefined;
+      if (!row) {
+        throw new FinError(
+          `Não achei o convite #${id}. Rode \`auth invites\` para ver a lista.`,
+        );
+      }
+
+      if (row.redeemed_at) {
+        throw new FinError(
+          `O convite #${id} já foi usado${row.redeemed_by ? ` por ${row.redeemed_by}` : ""}. ` +
+            "Revogar o convite não tira o acesso de ninguém — para isso use " +
+            "`auth revoke --user <id do Telegram>`.",
+        );
+      }
+
+      if (row.revoked_at) return { invite: inviteView(row, at), already_revoked: true };
+
+      db.prepare(
+        "UPDATE invites SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL " +
+          "AND redeemed_at IS NULL",
+      ).run(at, id);
+      return {
+        invite: inviteView({ ...row, revoked_at: at }, at),
+        already_revoked: false,
+      };
+    },
+    "IMMEDIATE",
+  );
+}
+
+/** Whether any invite was ever minted, i.e. whether this install uses them. */
+export function anyInvites(db: Db): boolean {
+  return db.prepare("SELECT 1 FROM invites LIMIT 1").get() !== undefined;
+}
+
+/**
+ * Consumes the invite this code belongs to, and registers the redeemer.
+ *
+ * Returns `undefined` when the code matches no *usable* invite — unknown, expired,
+ * revoked and already-redeemed are all the same answer, so the caller reports a
+ * plain wrong code and probing tells an outsider nothing about which invites
+ * exist.
+ *
+ * Atomicity, which is the whole reason this function exists instead of two calls:
+ *
+ * - `BEGIN IMMEDIATE` takes the write lock up front. A second process redeeming
+ *   the same code waits on it (`busy_timeout`), and when it gets in it reads the
+ *   row *after* the first commit — so it sees `redeemed_at` set and simply misses.
+ *   With a deferred transaction it would read the stale snapshot and blow up at
+ *   COMMIT with a raw SQLite error instead.
+ * - The UPDATE repeats every condition in its WHERE clause and requires exactly
+ *   one changed row. Belt and braces against any path that gets here without the
+ *   lock.
+ * - `register` runs *inside* the transaction. If the UPDATE finds nothing to
+ *   consume, the rollback takes the user row with it — a redemption that lost the
+ *   race must not leave somebody authenticated — and this returns `undefined`, so
+ *   the loser is told the code is wrong. Which it is: by then it is spent.
+ */
+export function redeemInvite(
+  db: Db,
+  rawCode: string,
+  register: () => number,
+  at: string = now(),
+): InviteView | undefined {
+  const normalized = normalizeInviteCode(rawCode);
+  if (!normalized) return undefined;
+  const hash = hashInviteCode(normalized);
+
+  try {
+    return runRedemption(db, hash, register, at);
+  } catch (e) {
+    if (e instanceof InviteRaceLost) return undefined;
+    throw e;
+  }
+}
+
+function runRedemption(
+  db: Db,
+  hash: string,
+  register: () => number,
+  at: string,
+): InviteView | undefined {
+  return transaction(
+    db,
+    () => {
+      const row = db.prepare("SELECT * FROM invites WHERE code_hash = ?").get(hash) as
+        | InviteRow
+        | undefined;
+      if (!row || inviteStatus(row, at) !== "pending") return undefined;
+
+      const userId = register();
+      const info = db
+        .prepare(
+          "UPDATE invites SET redeemed_at = ?, redeemed_by_user_id = ? " +
+            " WHERE id = ? AND redeemed_at IS NULL AND revoked_at IS NULL " +
+            "   AND expires_at > ?",
+        )
+        .run(at, userId, row.id, at);
+
+      if (Number(info.changes) !== 1) {
+        // Unwinds `register()` with it: the rollback is the point.
+        throw new InviteRaceLost();
+      }
+
+      return inviteView({ ...row, redeemed_at: at, redeemed_by_user_id: userId }, at);
+    },
+    "IMMEDIATE",
+  );
+}
+
+/** Internal: the loser of a simultaneous redemption. Never reaches the user. */
+class InviteRaceLost extends Error {}
+
+/* -- Per-person revocation --------------------------------------------------- */
+
+export interface RevokeUserResult {
+  telegram_user_id: string;
+  user_id: number;
+  /** Whether that person had a live session at the moment it was revoked. */
+  was_current: boolean;
+  /** Proof that nothing was deleted: their rows are still counted here. */
+  transactions_preserved: number;
+  /** The invite they came in through, when they came in through one. */
+  invite_id: number | null;
+}
+
+/**
+ * Cuts one person off, and nobody else.
+ *
+ * The scalpel to `logout-all`'s panic button: that one bumps the global epoch and
+ * everybody re-authenticates, this one touches a single row.
+ *
+ * The mechanism is the `active` flag that migration 2 already added and
+ * `isSessionCurrent` already checks — so `requireUser` refuses this person from the
+ * next command on, with the same answer an unknown id gets. No new concept, no
+ * second place to look.
+ *
+ * **Their data is never deleted**, same principle as `logout-all`: the ledger is
+ * theirs, and revoking access is not a reason to destroy it. They come back by
+ * redeeming a new invite, which flips `active` on again and finds everything where
+ * they left it.
+ */
+export function revokeUser(
+  db: Db,
+  telegramUserId: string,
+  epoch: number,
+): RevokeUserResult {
+  const user = findUser(db, telegramUserId);
+  if (!user) {
+    throw new FinError(
+      `Não achei ninguém com o id ${telegramUserId}. Rode \`auth users\` para ver ` +
+        "quem está cadastrado.",
+    );
+  }
+
+  const transactions = db
+    .prepare("SELECT COUNT(*) AS n FROM transactions WHERE user_id = ?")
+    .get(user.id) as { n: number };
+  const invite = db
+    .prepare(
+      "SELECT id FROM invites WHERE redeemed_by_user_id = ? ORDER BY id DESC LIMIT 1",
+    )
+    .get(user.id) as { id: number } | undefined;
+
+  db.prepare("UPDATE users SET active = 0 WHERE id = ?").run(user.id);
+
+  return {
+    telegram_user_id: user.telegram_user_id,
+    user_id: user.id,
+    was_current: isSessionCurrent(user, epoch),
+    transactions_preserved: Number(transactions.n),
+    invite_id: invite ? invite.id : null,
+  };
 }
 
 /* -- app_state: the global key/value the auth state lives in ---------------- */
