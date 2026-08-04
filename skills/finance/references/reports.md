@@ -10,10 +10,35 @@ introduces number errors and burns context.
 
 It contains, in order: the period · expenses · income · net result · comparison
 with the previous period · category ranking with percentages · the five largest
-expenses · any budget in warning or over.
+expenses · **what is still to pay** · any budget in warning or over.
 
 `--top` controls how many categories make the ranking (default 8). For the daily
 digest, `--top 3` reads better.
+
+### Where pending money shows up
+
+Every headline number in a report is money that **actually left**: `💸 Gastos`, the
+category ranking, the daily average, the largest expenses. A fixed cost that has
+fallen due and has not been paid is not spending yet, so it is not in there.
+
+It appears in its own block instead, with the due date and how late it is:
+
+> *A pagar:* R$ 1.619,90
+> ⏳ Aluguel — R$ 1.500,00 · vence 05/08 — 3 dias em atraso
+> ⏳ Internet — R$ 119,90 · vence 08/08
+
+And the budget lines quote the **committed** figure — paid plus due — with the
+unpaid part called out, because that number will not match the balance otherwise:
+
+> 🔴 Moradia estourou: R$ 1.600,00 de R$ 1.600,00 (100%) (R$ 1.500,00 ainda a pagar)
+
+Send all of it as it came. If the user asks why the report says R$ 1.600 and the
+balance does not agree, that is the answer: R$ 1.500 of it is committed and still in
+the account.
+
+`summary` carries the same split as data: `expenses_cents` (paid), `pending_cents`,
+`pending_count` and `pending[]` with one entry per unpaid bill. `count` covers both,
+so a period with nothing but unpaid bills is not an empty period.
 
 ## `summary` — raw data
 
@@ -24,7 +49,9 @@ report". Useful fields:
 
 | Field | What it is |
 |---|---|
-| `expenses_fmt` / `income_fmt` | Period totals |
+| `expenses_fmt` / `income_fmt` | Period totals — paid money only |
+| `pending_fmt` / `pending_count` | Bills due in the period and not yet paid |
+| `pending[]` | Each one, with `date`, `amount_fmt` and `days_overdue` |
 | `net_fmt` | Income minus expenses |
 | `daily_average_fmt` | Average spending per day in the period |
 | `count` | Number of transactions |
@@ -62,12 +89,13 @@ To compare two specific months, call `summary` twice:
 
 ## The scheduled reports
 
-Cron fires five routines. They reach you as an ordinary instruction; what differs
+Cron fires these routines. They reach you as an ordinary instruction; what differs
 is that nobody is waiting on the other end.
 
 | When | What to do |
 |---|---|
 | Daily, 06:00 | `recurring apply`. If `silent` is true, reply only `[SILENT]`. |
+| Daily, morning † | `recurring due --in 1` — the bill reminder. If `silent` is true, reply only `[SILENT]`. |
 | Daily, 21:00 | `report --period today --top 3`. If there were no transactions, reply only `[SILENT]`. |
 | Sunday, 20:00 | `report --period week`, plus one closing sentence about the week. |
 | 1st of the month, 09:00 | `report --period last-month`, plus a CSV export. |
@@ -77,6 +105,34 @@ is that nobody is waiting on the other end.
 exactly `[SILENT]`, nothing else. The gateway recognises that marker and delivers
 no message at all. If you reply "hoje não houve gastos", the user gets a pointless
 notification — and a bot that notifies for no reason is a bot they mute.
+
+### The bill reminder
+
+† The command and its expected behaviour are settled; the cron entry itself is
+installed by `hermes/cron-jobs.sh`, alongside the other `tally-*` jobs. Until it is
+added there, this is what the job will do when it fires — and what to do if someone
+asks about upcoming bills by hand.
+
+    fin.ts recurring due --in 1
+
+This reads the **schedule**, not the ledger, which is the only way a reminder can
+fire the day *before* something is due: the occurrence does not exist until the due
+date arrives (`recurring apply` creates it then). So `due` is what the reminder job
+calls, and `pending` is what answers "what do I still owe".
+
+- `silent: true` — nothing falls due in the window. Reply exactly `[SILENT]`.
+- Otherwise, one line per bill, with the amount and the date, and nothing else. No
+  advice, no total unless there are several, no comment on the amount:
+
+> 🔔 Amanhã vence a Internet, R$ 119,90.
+
+- When `auto_debit` is true, say that no action is needed — a reminder that makes
+  someone go and pay something the bank already took is worse than no reminder:
+
+> 🔔 Amanhã vence o Aluguel, R$ 1.500,00 — débito automático, não precisa fazer nada.
+
+Do not fold this into the 21:00 digest and do not repeat it later in the day: the
+same bill mentioned twice is how a reminder becomes noise.
 
 ## Export
 

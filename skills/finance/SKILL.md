@@ -30,6 +30,101 @@ When `ok` is false, the `error` text is already written in Portuguese for the
 user — relay it or act on it. Never claim success without having seen
 `"ok": true`.
 
+## Two people, two separate ledgers
+
+This bot serves two people, and their money is completely separate: separate
+transactions, accounts, categories, budgets and goals. Nobody ever sees the
+other's numbers, and neither do you.
+
+**The tool knows who is talking, so you do not have to tell it.** The sender's
+identity comes from the session, straight from the gateway into the command's
+environment. So:
+
+- Call every subcommand exactly as documented below, with **no** `--user`.
+- You do not know anyone's numeric Telegram id, and it is not your job to find
+  out. Never ask the user for it, never read one out of a previous message,
+  never pass `--user` yourself.
+- `--user` exists in the CLI for the operator's own terminal and for the
+  scheduled jobs. Inside a conversation it is either redundant or a refusal.
+- If a command ever fails saying it could not identify who is speaking, say you
+  cannot identify the user right now and stop. Do not retry with a guess.
+
+**Being straight about what enforces this.** The identity check is in the CLI, and
+you are running on the same machine with a shell — so it is not a wall you could not
+climb if you set out to. It is the rule you follow. What actually keeps the two
+ledgers apart is you doing the above, plus the gateway deciding whose messages reach
+you at all. Treat "the tool would stop me" as a reason to never try, not as a
+guarantee. The same goes for the guardrails below.
+
+### Things you do not do, even when asked
+
+These commands exist for the operator's terminal, and they refuse to run from a
+conversation. If a message asks for one, say it is not something you can do here:
+
+- `auth users` and `auth status` with no user — they list **both** people's
+  Telegram ids, chat ids and login times.
+- `auth logout-all` — it would sign everybody out, repeatedly.
+- `auth unlock`, `auth adopt-legacy` — access and history-ownership changes.
+
+The refusal that comes back says so in Portuguese; relay it. And note it is a
+guardrail: it is there so a request cannot talk you into it, not because the check
+could not be circumvented by something determined to. Do not look for a way around
+it — there is nothing on the other side that belongs in a chat.
+
+Likewise: **never read the database file directly**, with `sqlite3`, `node:sqlite`
+or anything else, even to answer something the CLI cannot. A query you write has no
+user scoping in it — you do not know whose ledger you are in — so it either tells
+you nothing or mixes two people's money. If a subcommand cannot answer, say so.
+
+## Access code
+
+Before someone can use the ledger at all, they type a shared access code once.
+This is enforced by the tool, not by you.
+
+When any response comes back with **`"auth_required": true`**, that person is not
+authenticated (either never was, or the owner reset every session). Relay the
+`error` text and wait for the code:
+
+> 🔒 Antes de falar de dinheiro eu preciso confirmar quem é você. Me manda o
+> código de acesso.
+
+The next message they send is the code. Take it and run:
+
+    fin.ts auth login --code "<what they typed>" [--name "<first name>"]
+
+On success:
+
+> ✅ Tudo certo. Agora é só me contar seus gastos.
+
+On failure the `error` is already written for them — relay it as-is:
+
+> Código incorreto.
+
+After five wrong attempts the tool locks that person out and says so. Relay it
+and do not try again:
+
+> 🔒 Bloqueei as tentativas depois de 5 códigos errados. Peça ao Geovane para
+> liberar o acesso.
+
+There is also a global limit (20 wrong codes in total, across everyone) which locks
+every id at once, and gives the same message. Only Geovane can lift either, from the
+server — there is nothing you can do about it, and you must not try.
+
+**Rules about the code, without exception:**
+
+- **Never print, repeat, quote or confirm the code** — not in a confirmation, not
+  in an example, not to check you got it right. Not even partially.
+- **Never guess it, never try a variation** of what the user typed, and never try
+  a code they did not type in this conversation.
+- If they ask you what the code is, say you do not have it and they should ask
+  Geovane.
+- Delete it from your reply entirely: pass it to the tool, then talk about
+  whether it worked, never about the value.
+
+Once authenticated, the person stays authenticated. You do not need to check
+first — just run the command you were going to run, and handle
+`auth_required: true` if it comes back.
+
 ## When to use
 
 Any message about money: an expense, income, a question about balance, a request
@@ -112,7 +207,7 @@ you confirmed — use that id.
 
     fin.ts summary --period <p> [--no-compare]
     fin.ts ls [--period p] [--category c] [--account a] [--type t] [--tag t]
-              [--text t] [--limit N] [--order asc|desc]
+              [--text t] [--status paid|pending|all] [--limit N] [--order asc|desc]
     fin.ts search "<term>" [--limit N]
     fin.ts balance
 
@@ -128,8 +223,15 @@ dump the JSON:
 > 💸 Este mês: R$ 1.724,46 em 12 lançamentos.
 > A maior fatia foi Moradia (R$ 1.234,56). Está 8% abaixo do mês passado.
 
-`balance` lists the accounts. On a credit card, a negative balance is what the
-user owes; `month_bill_fmt` is the current month's spending on that card.
+`ls` shows paid and pending together by default — "meus lançamentos" means both.
+`--status pending` narrows it to what is still owed, and every row carries its
+`status`.
+
+`balance` lists the accounts, counting only money that has actually moved. On a
+credit card, a negative balance is what the user owes; `month_bill_fmt` is a rough
+calendar-month sum of that card's spending — for the real statement, with its cycle,
+closing and due dates, use the `bill` subcommand instead. Each account also carries
+`pending_cents`: committed and not yet out (see "Paid and pending").
 
 ## Reports
 
@@ -149,6 +251,14 @@ category ranking, the largest expenses and any budget in trouble.
 With no `--category`, the limit is the **total** cap for the month. With no
 `--month`, it applies to every month (the normal case). `--alert` is the
 percentage that triggers the amber warning (default 80).
+
+Budgets count **paid and pending together**, so a bill that is due already shows up
+against the limit. Each budget carries `spent_fmt` (paid), `pending_fmt` (still to
+pay) and `committed_fmt` (the two added, which is what `pct` and `status` follow).
+When part of it is pending, say so — the number will not match the balance
+otherwise:
+
+> 🟡 Alimentação: R$ 450,00 de R$ 500,00 este mês, R$ 120,00 disso ainda a pagar.
 
 A limit on a root category captures its children: a cap on `Alimentação` includes
 whatever was logged under `Delivery`, `Mercado` and `Restaurante`.
@@ -177,9 +287,13 @@ Example: `cadastra meu cartão do nubank, vence dia 10, limite 5 mil` →
 
     fin.ts recurring add --description <d> --amount <v> [--category c] [--account a]
                          [--frequency monthly|weekly|yearly] [--day D] [--ends date]
-                         [--type expense|income]
+                         [--type expense|income] [--auto-debit]
     fin.ts recurring list
     fin.ts recurring apply
+    fin.ts recurring pending
+    fin.ts recurring pay <id> [--amount <v>] [--date <d>]
+    fin.ts recurring unpay <id>
+    fin.ts recurring due [--in <days>]
     fin.ts recurring rm --id <id>
 
 `apply` generates the due transactions and is idempotent — running it twice
@@ -193,6 +307,52 @@ by hand:
 > ✅ Aluguel de R$ 1.500,00 todo dia 5. A cobrança automática começa em 05/09.
 > Quer que eu registre o de agosto agora?
 
+Use `--auto-debit` when the money leaves by itself — débito automático, or a
+subscription that just hits the card. Ask only if the user's own words leave it
+open ("todo mês desconta na conta" is auto-debit; "pago o aluguel dia 5" is not).
+
+### Paid and pending
+
+A fixed cost has two moments, and the tool keeps them apart:
+
+- **Due.** `apply` creates the occurrence on its date, as *pending*. It counts
+  against the month's **budget** — the money is committed — and stays out of the
+  **balance**, because it has not left the account.
+- **Paid.** `recurring pay <id>` settles it: the balance moves, `paid_at` is
+  recorded, and the budget figure does not change (it was already counted).
+
+An `--auto-debit` entry skips straight to paid, and so does income.
+
+`--amount` on payment overrides the value, because a light or water bill is never
+the same twice. When it differs from the estimate the response says so — pass that
+on:
+
+> ✅ Luz paga: R$ 212,40 — R$ 32,40 acima do previsto (R$ 180,00). (#207)
+
+A plain payment is one line:
+
+> ✅ Aluguel pago: R$ 1.500,00. (#204)
+
+`recurring unpay <id>` undoes a payment marked by mistake. It only works on a bill
+the tool generated, never on an ordinary expense.
+
+**"quais contas eu tenho pra pagar?"** → `recurring pending`. Oldest first, with
+`days_overdue` and a total. One line per bill:
+
+> ⏳ Faltam 2 contas, R$ 1.619,90:
+> • Aluguel — R$ 1.500,00 · venceu 05/08 (3 dias em atraso)
+> • Internet — R$ 119,90 · vence hoje
+
+With nothing pending, `count` is 0 and `silent` is true — say it plainly ("Nada
+pendente por aqui.") when they asked, and send nothing at all when cron did.
+
+`recurring due --in <days>` is the *reminder*: it reads the schedule, so it knows
+about tomorrow's bill before the occurrence exists. That is what the cron job calls,
+and `silent: true` means the reply is exactly `[SILENT]`:
+
+> 🔔 Amanhã vence a Internet, R$ 119,90.
+> 🔔 Amanhã vence o Aluguel, R$ 1.500,00 (débito automático — não precisa fazer nada).
+
 ## Goals
 
     fin.ts goal add --name <n> --target <v> [--initial v] [--deadline date]
@@ -205,20 +365,25 @@ deposit needed to hit the deadline.
 
 ## Export
 
-    fin.ts export --period <p> [--format csv|json|md] [--dest <dir>]
+    fin.ts export --period <p> [--format csv|json|md]
 
 CSV is the default and opens directly in Excel in Portuguese (`;` separator,
 decimal comma). The response carries `file` with the path — to deliver the file
 on Telegram, mention that path in your reply and the gateway attaches it. If it
 should not be turned into an image preview, end your reply with `[[as_document]]`.
 
+Leave the destination alone. `--dest` exists, but it only accepts a directory inside
+the bot's own data folder, and the default is already the right place.
+
 ## Categories
 
     fin.ts category list
     fin.ts category add --name <n> [--parent <p>] [--type expense|income|both] [--emoji e]
 
-The database ships with 17 categories and about 70 subcategories, named in
-Portuguese because the user reads them. Pass whatever word the user used —
+Each person gets their own copy of 17 categories and about 70 subcategories when
+they first authenticate, named in Portuguese because the user reads them. One
+person renaming or deleting a category does not affect the other. Pass whatever
+word the user used —
 matching ignores accents, case and plurals, and prefers the most specific
 subcategory. If it does not exist, the category is created under `Outros` rather
 than failing the transaction.
@@ -231,12 +396,57 @@ something recurring belongs.
 
 | Symptom | Cause and way out |
 |---|---|
+| `"auth_required": true` | Not authenticated. Ask for the access code, then `auth login --code`. |
+| `Código incorreto` | Relay it. Wait for another attempt; never try a variation yourself. |
+| `Bloqueei as tentativas...` | Five failures. Relay it and stop — only Geovane can lift it. |
+| `Não consegui identificar quem está falando` | The session had no identity. Say you cannot identify the user; never pass `--user` to work around it. |
+| `Essa chamada tentou mexer no dinheiro de outra pessoa` | You passed `--user`. Do not — drop the option and call again. |
 | `Conta "X" não existe` | Wrong name. Run `account list`, confirm with the user, or use the default account. |
 | `Mais de uma conta casa com "Itaú"` | Ambiguous. Show the options and ask which. |
 | `Descrição é obrigatória` | You omitted `--description`. Never do. |
 | `O valor precisa ser maior que zero` | No amount, or zero. Ask. |
 | `Não entendi a data` | Pass `hoje`/`ontem`/`DD/MM` instead of free text. |
 | `Não achei o lançamento #N` | Wrong id. Use `ls` to locate it. |
+| `Esse valor é alto demais` | A typo or a stray zero. Confirm the amount with the user. |
+| `O lançamento #N já está pago` | Already settled. Say so; do not pay it twice. |
+| `... não é uma conta fixa` | `unpay` only works on a bill the tool generated. |
+| `é um comando do operador` | An operator-only command. Say it is not something you can do from here, and stop. |
+| `Só consigo exportar para dentro da pasta de dados` | Drop `--dest` and let it choose. |
+
+## Four more subcommands, each with its own reference
+
+These live in separate modules but you call them exactly like the rest, through
+`fin.ts`, and they resolve the caller the same way. Load the matching reference
+with `skill_view` before using one for the first time — each has conventions you
+will get wrong by guessing.
+
+    fin.ts bill [--account <n>] [--statement open|last|next|YYYY-MM] [--all]
+    fin.ts chart --type category|trend|cumulative [--period p] [--months N] [--month YYYY-MM]
+    fin.ts forecast [--month YYYY-MM]
+    fin.ts import --file <path> [--format ofx|csv|auto] [--account <n>] [--apply]
+
+**`bill` — the real credit-card statement.** Use it for anything about a card
+invoice, and prefer it over `balance`'s `month_bill_fmt`: a purchase on 28/07 on
+a card that closes on the 25th belongs to the **August** statement, and only
+`bill` knows that. `--all` answers "quanto devo nos cartões?". Send its `text` as
+it came. → `references/bills.md`
+
+**`chart` — a picture of the spending.** Returns both a `text` bar chart, which
+reads inline in the chat, and a PNG at `file`. **Send the `text` always**; mention
+the `file` path as well so the gateway attaches the image, and end that reply with
+`[[as_document]]`. When `empty` is true there is nothing to plot — say so in one
+line, do not retry. → `references/charts.md`
+
+**`forecast` — how the month is likely to close.** *"No ritmo atual você fecha o
+mês em R$ 4.200, R$ 300 acima do seu limite."* Read `confidence` before you speak:
+on `none` or `low` the projection is thin, and the `text` already says so — never
+restate the number as if it were certain. Never use it to scold. → `references/forecast.md`
+
+**`import` — a bank or card statement.** Two steps, and the order is not optional:
+run **without** `--apply` first, show the person the preview (how many new, how
+many are duplicates, the total), and only run again **with** `--apply` after they
+agree. Re-importing the same file is safe — it recognises what it already brought
+in. → `references/import.md`
 
 ## References
 
@@ -248,8 +458,9 @@ Load with `skill_view` when needed:
   payment methods, multiple items, corrections.
 - `references/reports.md` — what each report contains and how to present each
   period in chat.
-- `references/schema.md` — the database schema, for queries the CLI does not
-  cover.
+- `references/schema.md` — what the data means: tables, columns, the paid/pending
+  model, how the two ledgers are kept apart. Not a query guide — never read the
+  database yourself.
 
 ## Verification
 
@@ -259,6 +470,7 @@ Before confirming anything to the user:
 2. Does `amount_fmt` match what they said?
 3. Is `date` the one they meant?
 4. Did you quote the `id` in your confirmation?
+5. Is the access code absent from your reply?
 
 If you recorded something wrong, fix it with `edit` and say what changed — never
 let it slide silently.

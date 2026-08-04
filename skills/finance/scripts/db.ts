@@ -14,10 +14,30 @@
  *   `Date.UTC` on the date components, never the process-local timezone.
  *
  * - Migrations are idempotent and versioned in `MIGRATIONS`; `migrate()` is safe
- *   to run on every boot and applies only what is missing.
+ *   to run on every boot and applies only what is missing. Never edit a
+ *   migration that has already shipped — append a new one.
+ *
+ * - Two people share this ledger and their money is fully separated: every
+ *   per-user table carries `user_id`, and every query has to filter on it. The
+ *   helpers here take `userId` as an explicit parameter and never default it,
+ *   because a silent default is exactly how one person ends up seeing the
+ *   other's balance.
+ *
+ * - A transaction is either `paid` or `pending`. `paid` is the default and covers
+ *   everything typed into the chat: you log an expense once the money is gone.
+ *   `pending` exists for a generated fixed cost that is due but not settled yet —
+ *   it counts against the month's budget (the money is committed) and stays out
+ *   of the balance (the money is still there). See migration 3.
  *
  * - Zero dependencies: `node:sqlite` is built in, so there is no `node_modules`,
  *   no build step and no native module to compile.
+ *
+ * - None of the checks in this codebase are a security boundary. The agent that
+ *   calls the CLI runs a shell as the same uid and can open this file with
+ *   `node:sqlite` directly, so user scoping, the lockout and the operator-only
+ *   commands are guardrails: they keep a promptable model from doing the wrong
+ *   thing by accident or on request. The boundary is the Hermes gateway
+ *   allowlist, one level up.
  *
  * Language split, applied throughout the codebase: identifiers, comments, table
  * and column names, and JSON keys are English. Anything the user ever reads is
@@ -28,11 +48,14 @@
 
 import { DatabaseSync } from "node:sqlite";
 import { mkdirSync } from "node:fs";
+import { createHash, timingSafeEqual } from "node:crypto";
 import { dirname, resolve } from "node:path";
 
 export type Cents = number & { readonly __brand: unique symbol };
 
 export type TransactionType = "expense" | "income" | "transfer";
+/** `paid` = the money moved. `pending` = due, committed, not out yet. */
+export type TransactionStatus = "paid" | "pending";
 export type AccountType =
   | "checking"
   | "card"
@@ -49,6 +72,7 @@ export const TRANSACTION_TYPES: readonly TransactionType[] = [
   "income",
   "transfer",
 ];
+export const TRANSACTION_STATUSES: readonly TransactionStatus[] = ["paid", "pending"];
 export const ACCOUNT_TYPES: readonly AccountType[] = [
   "checking",
   "card",
@@ -60,9 +84,32 @@ export const ACCOUNT_TYPES: readonly AccountType[] = [
 
 export const DEFAULT_DB = process.env.TALLY_DB ?? "/opt/data/finance/tally.db";
 
-export const CURRENT_SCHEMA_VERSION = 1;
+export const CURRENT_SCHEMA_VERSION = 3;
 
 const TZ = "America/Sao_Paulo";
+
+/** Consecutive wrong codes before that Telegram id stops accepting attempts. */
+export const MAX_FAILED_ATTEMPTS = 5;
+
+/**
+ * Wrong codes across *all* ids before nobody may try again.
+ *
+ * The per-id counter alone is not a limit: whoever is guessing controls the id
+ * they claim to be, so every new value bought five fresh attempts. This one is
+ * global, and 20 is four full per-id budgets — high enough that two people
+ * mistyping the code on a bad day do not trip it, low enough that enumerating
+ * ids stops being a way around the lockout. Only `auth unlock` lifts it.
+ */
+export const MAX_GLOBAL_FAILED_ATTEMPTS = 20;
+
+/**
+ * The largest amount the ledger accepts, in cents — R$ 100.000.000,00.
+ *
+ * Anything above this is a typo or a probe, never a grocery bill. Without a
+ * ceiling, `1e307` reached SQLite as `Infinity` and came back as a raw
+ * "NOT NULL constraint failed" in the middle of a chat.
+ */
+export const MAX_AMOUNT_CENTS = 10_000_000_000;
 
 /**
  * An expected error whose message is safe to show the end user.
@@ -72,6 +119,16 @@ const TZ = "America/Sao_Paulo";
  * about SQL.
  */
 export class FinError extends Error {}
+
+/**
+ * The caller is not authenticated (never was, or the session was revoked).
+ *
+ * The CLI adds `"auth_required": true` to the response for this one, and that
+ * flag is the agent's single cue to ask for the access code. Deliberately the
+ * same error for "unknown id" and "revoked session": the agent handles one case,
+ * and an outsider probing ids learns nothing.
+ */
+export class AuthRequiredError extends FinError {}
 
 export const cents = (n: number): Cents => n as Cents;
 
@@ -314,7 +371,16 @@ export function parseAmount(value: unknown): Cents {
     if (negative) total = -total;
   }
 
+  // `1e307` parses fine and then overflows to Infinity once multiplied by 100,
+  // which used to reach SQLite and surface as a constraint error in the chat.
+  if (!Number.isFinite(total)) throw new FinError("Valor inválido.");
   if (total === 0) throw new FinError("O valor precisa ser maior que zero.");
+  if (Math.abs(total) > MAX_AMOUNT_CENTS) {
+    throw new FinError(
+      `Esse valor é alto demais para eu registrar (máximo ${formatMoney(MAX_AMOUNT_CENTS)}). ` +
+        "Confere se não sobrou um zero.",
+    );
+  }
   return cents(Math.abs(total));
 }
 
@@ -426,6 +492,26 @@ export function periodRange(period?: string, reference?: string): Period {
 export function isValidMonth(month: string): boolean {
   return /^\d{4}-(0[1-9]|1[0-2])$/.test(month);
 }
+
+/**
+ * `now()` as a SQL expression, for migrations.
+ *
+ * `MIGRATIONS` is static text, so a timestamp has to be computed by SQLite. The
+ * `-3 hours` shift plus the literal offset reproduce what `now()` returns in
+ * São Paulo, which is the format every audit column already holds.
+ */
+const SQL_NOW = "(strftime('%Y-%m-%dT%H:%M:%S','now','-3 hours') || '-03:00')";
+
+/**
+ * The placeholder user that inherits rows written before multi-user support.
+ *
+ * Nobody can log in as it: `--user legacy` is rejected, and a real login creates
+ * a separate user with an empty ledger. Claiming that history is a deliberate,
+ * operator-run step — `auth adopt-legacy --user <telegram id>`, which re-points
+ * these rows and removes the placeholder. Until then they sit here, reachable by
+ * nothing.
+ */
+const LEGACY_USER_ID = "(SELECT id FROM users WHERE telegram_user_id = 'legacy')";
 
 const MIGRATIONS: readonly { version: number; sql: string }[] = [
   {
@@ -574,6 +660,353 @@ const MIGRATIONS: readonly { version: number; sql: string }[] = [
     LEFT JOIN accounts ad   ON ad.id = t.dest_account_id;
     `,
   },
+  {
+    // Multi-user. Two people share the bot, so every ledger table gains
+    // `user_id` and every UNIQUE constraint becomes per-user.
+    //
+    // SQLite cannot alter a UNIQUE constraint, hence the create-new / copy /
+    // drop / rename dance for every table. Foreign keys are switched off for the
+    // duration: with them on, `ALTER TABLE ... RENAME` would rewrite the
+    // REFERENCES clauses of the other tables and point them at the `_v2`
+    // scratch names. Ids are preserved on copy, so existing references and the
+    // ids the user already quoted in chat stay valid.
+    version: 2,
+    sql: `
+    PRAGMA foreign_keys = OFF;
+
+    CREATE TABLE users (
+        id               INTEGER PRIMARY KEY AUTOINCREMENT,
+        -- TEXT, not INTEGER: Telegram ids are already past 2^32 and a JSON
+        -- number would eventually lose precision. As text they never do.
+        telegram_user_id TEXT    NOT NULL UNIQUE,
+        -- Where to deliver this person's scheduled reports. Recorded at login
+        -- from the session, and only when the conversation is a private one —
+        -- a group chat id here would publish somebody's ledger to the group.
+        telegram_chat_id TEXT,
+        display_name     TEXT,
+        authenticated_at TEXT,
+        auth_epoch       INTEGER NOT NULL DEFAULT 0,
+        failed_attempts  INTEGER NOT NULL DEFAULT 0,
+        active           INTEGER NOT NULL DEFAULT 1,
+        created_at       TEXT    NOT NULL
+    );
+
+    -- Global, not per user: 'auth_epoch' lives here, and bumping it is what
+    -- logs everybody out at once.
+    CREATE TABLE app_state (
+        key   TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    );
+
+    INSERT INTO app_state (key, value) VALUES ('auth_epoch', '0');
+
+    -- Recreated at the end, exposing user_id.
+    DROP VIEW v_transactions;
+
+    -- Anything already in the database belongs to whoever was using the bot
+    -- before this migration. It gets attached to a placeholder user with
+    -- authenticated_at NULL; the rows are never dropped. Logging in is NOT
+    -- enough to reach them — a login creates a different user with an empty
+    -- ledger — so claiming them is an explicit operator step,
+    -- 'auth adopt-legacy --user <telegram id>'. Skipped entirely on a database
+    -- that is empty (a fresh install, where migration 1 has just created bare
+    -- tables).
+    INSERT INTO users (telegram_user_id, telegram_chat_id, display_name,
+                       authenticated_at, auth_epoch, created_at)
+    SELECT 'legacy', NULL, 'Legacy', NULL, 0, ${SQL_NOW}
+     WHERE EXISTS (SELECT 1 FROM accounts)
+        OR EXISTS (SELECT 1 FROM categories)
+        OR EXISTS (SELECT 1 FROM transactions)
+        OR EXISTS (SELECT 1 FROM budgets)
+        OR EXISTS (SELECT 1 FROM recurring)
+        OR EXISTS (SELECT 1 FROM goals)
+        OR EXISTS (SELECT 1 FROM tags)
+        OR EXISTS (SELECT 1 FROM sent_alerts)
+        OR EXISTS (SELECT 1 FROM settings);
+
+    CREATE TABLE accounts_v2 (
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id        INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        name           TEXT    NOT NULL,
+        type           TEXT    NOT NULL DEFAULT 'checking'
+                         CHECK (type IN ('checking','card','cash',
+                                         'savings','investment','voucher')),
+        institution    TEXT,
+        closing_day    INTEGER CHECK (closing_day BETWEEN 1 AND 31),
+        due_day        INTEGER CHECK (due_day BETWEEN 1 AND 31),
+        limit_cents    INTEGER,
+        opening_balance_cents INTEGER NOT NULL DEFAULT 0,
+        active         INTEGER NOT NULL DEFAULT 1,
+        created_at     TEXT    NOT NULL,
+        UNIQUE (user_id, name)
+    );
+    INSERT INTO accounts_v2 (id, user_id, name, type, institution, closing_day,
+                             due_day, limit_cents, opening_balance_cents,
+                             active, created_at)
+    SELECT id, ${LEGACY_USER_ID}, name, type, institution, closing_day,
+           due_day, limit_cents, opening_balance_cents, active, created_at
+      FROM accounts;
+    DROP TABLE accounts;
+    ALTER TABLE accounts_v2 RENAME TO accounts;
+    CREATE INDEX idx_accounts_user ON accounts(user_id, active);
+
+    CREATE TABLE categories_v2 (
+        id        INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id   INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        name      TEXT    NOT NULL,
+        parent_id INTEGER REFERENCES categories(id) ON DELETE SET NULL,
+        type      TEXT    NOT NULL DEFAULT 'expense'
+                    CHECK (type IN ('expense','income','both')),
+        emoji     TEXT,
+        active    INTEGER NOT NULL DEFAULT 1,
+        UNIQUE (user_id, name, parent_id)
+    );
+    INSERT INTO categories_v2 (id, user_id, name, parent_id, type, emoji, active)
+    SELECT id, ${LEGACY_USER_ID}, name, parent_id, type, emoji, active
+      FROM categories;
+    DROP TABLE categories;
+    ALTER TABLE categories_v2 RENAME TO categories;
+    CREATE INDEX idx_categories_user ON categories(user_id, active);
+
+    CREATE TABLE recurring_v2 (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        description  TEXT    NOT NULL,
+        type         TEXT    NOT NULL DEFAULT 'expense'
+                       CHECK (type IN ('expense','income')),
+        amount_cents INTEGER NOT NULL,
+        category_id  INTEGER REFERENCES categories(id),
+        account_id   INTEGER REFERENCES accounts(id),
+        frequency    TEXT    NOT NULL DEFAULT 'monthly'
+                       CHECK (frequency IN ('monthly','weekly','yearly')),
+        day          INTEGER NOT NULL DEFAULT 1,
+        next_date    TEXT    NOT NULL,
+        ends_on      TEXT,
+        active       INTEGER NOT NULL DEFAULT 1,
+        created_at   TEXT    NOT NULL
+    );
+    INSERT INTO recurring_v2 (id, user_id, description, type, amount_cents,
+                              category_id, account_id, frequency, day,
+                              next_date, ends_on, active, created_at)
+    SELECT id, ${LEGACY_USER_ID}, description, type, amount_cents,
+           category_id, account_id, frequency, day,
+           next_date, ends_on, active, created_at
+      FROM recurring;
+    DROP TABLE recurring;
+    ALTER TABLE recurring_v2 RENAME TO recurring;
+    CREATE INDEX idx_recurring_user ON recurring(user_id, active, next_date);
+
+    CREATE TABLE transactions_v2 (
+        id                INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id           INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        type              TEXT    NOT NULL
+                            CHECK (type IN ('expense','income','transfer')),
+        amount_cents      INTEGER NOT NULL CHECK (amount_cents > 0),
+        description       TEXT    NOT NULL,
+        date              TEXT    NOT NULL,
+        category_id       INTEGER REFERENCES categories(id),
+        account_id        INTEGER REFERENCES accounts(id),
+        dest_account_id   INTEGER REFERENCES accounts(id),
+        note              TEXT,
+        source            TEXT    NOT NULL DEFAULT 'telegram',
+        recurring_id      INTEGER REFERENCES recurring(id) ON DELETE SET NULL,
+        installment_num   INTEGER,
+        installment_total INTEGER,
+        installment_group TEXT,
+        created_at        TEXT    NOT NULL,
+        updated_at        TEXT    NOT NULL,
+        CHECK (type <> 'transfer' OR dest_account_id IS NOT NULL),
+        CHECK (dest_account_id IS NULL OR dest_account_id <> account_id)
+    );
+    INSERT INTO transactions_v2 (id, user_id, type, amount_cents, description,
+                                 date, category_id, account_id, dest_account_id,
+                                 note, source, recurring_id, installment_num,
+                                 installment_total, installment_group,
+                                 created_at, updated_at)
+    SELECT id, ${LEGACY_USER_ID}, type, amount_cents, description,
+           date, category_id, account_id, dest_account_id,
+           note, source, recurring_id, installment_num,
+           installment_total, installment_group, created_at, updated_at
+      FROM transactions;
+    DROP TABLE transactions;
+    ALTER TABLE transactions_v2 RENAME TO transactions;
+
+    -- Every listing, total and report filters by user first and then by date,
+    -- so user_id leads every composite index.
+    CREATE INDEX idx_tx_user_date     ON transactions(user_id, date);
+    CREATE INDEX idx_tx_user_category ON transactions(user_id, category_id, date);
+    CREATE INDEX idx_tx_user_account  ON transactions(user_id, account_id, date);
+    CREATE INDEX idx_tx_user_type     ON transactions(user_id, type, date);
+    CREATE INDEX idx_tx_user_dest     ON transactions(user_id, dest_account_id);
+    CREATE INDEX idx_tx_recurring     ON transactions(recurring_id, date);
+    CREATE INDEX idx_tx_group         ON transactions(installment_group);
+
+    CREATE TABLE tags_v2 (
+        id      INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        name    TEXT NOT NULL,
+        UNIQUE (user_id, name)
+    );
+    INSERT INTO tags_v2 (id, user_id, name)
+    SELECT id, ${LEGACY_USER_ID}, name FROM tags;
+    DROP TABLE tags;
+    ALTER TABLE tags_v2 RENAME TO tags;
+    CREATE INDEX idx_tags_user ON tags(user_id);
+
+    CREATE TABLE budgets_v2 (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        category_id INTEGER REFERENCES categories(id) ON DELETE CASCADE,
+        month       TEXT,
+        limit_cents INTEGER NOT NULL CHECK (limit_cents > 0),
+        alert_pct   INTEGER NOT NULL DEFAULT 80
+                      CHECK (alert_pct BETWEEN 1 AND 100),
+        created_at  TEXT    NOT NULL,
+        UNIQUE (user_id, category_id, month)
+    );
+    INSERT INTO budgets_v2 (id, user_id, category_id, month, limit_cents,
+                            alert_pct, created_at)
+    SELECT id, ${LEGACY_USER_ID}, category_id, month, limit_cents,
+           alert_pct, created_at
+      FROM budgets;
+    DROP TABLE budgets;
+    ALTER TABLE budgets_v2 RENAME TO budgets;
+    CREATE INDEX idx_budgets_user ON budgets(user_id);
+
+    CREATE TABLE goals_v2 (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        name         TEXT    NOT NULL,
+        target_cents INTEGER NOT NULL CHECK (target_cents > 0),
+        saved_cents  INTEGER NOT NULL DEFAULT 0,
+        deadline     TEXT,
+        active       INTEGER NOT NULL DEFAULT 1,
+        created_at   TEXT    NOT NULL,
+        UNIQUE (user_id, name)
+    );
+    INSERT INTO goals_v2 (id, user_id, name, target_cents, saved_cents,
+                          deadline, active, created_at)
+    SELECT id, ${LEGACY_USER_ID}, name, target_cents, saved_cents,
+           deadline, active, created_at
+      FROM goals;
+    DROP TABLE goals;
+    ALTER TABLE goals_v2 RENAME TO goals;
+    CREATE INDEX idx_goals_user ON goals(user_id, active);
+
+    CREATE TABLE sent_alerts_v2 (
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        key     TEXT NOT NULL,
+        month   TEXT NOT NULL,
+        level   TEXT NOT NULL,
+        sent_at TEXT NOT NULL,
+        PRIMARY KEY (user_id, key, month, level)
+    );
+    INSERT INTO sent_alerts_v2 (user_id, key, month, level, sent_at)
+    SELECT ${LEGACY_USER_ID}, key, month, level, sent_at FROM sent_alerts;
+    DROP TABLE sent_alerts;
+    ALTER TABLE sent_alerts_v2 RENAME TO sent_alerts;
+
+    CREATE TABLE settings_v2 (
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        key     TEXT NOT NULL,
+        value   TEXT NOT NULL,
+        PRIMARY KEY (user_id, key)
+    );
+    INSERT INTO settings_v2 (user_id, key, value)
+    SELECT ${LEGACY_USER_ID}, key, value FROM settings;
+    DROP TABLE settings;
+    ALTER TABLE settings_v2 RENAME TO settings;
+
+    CREATE VIEW v_transactions AS
+    SELECT
+        t.id, t.user_id, t.type, t.amount_cents, t.description, t.date,
+        t.note, t.source, t.installment_num, t.installment_total,
+        t.installment_group, t.recurring_id, t.created_at, t.updated_at,
+        t.category_id,
+        COALESCE(c.name, 'Sem categoria') AS category,
+        cp.name                           AS parent_category,
+        c.emoji                           AS category_emoji,
+        t.account_id,
+        COALESCE(a.name, 'Sem conta')     AS account,
+        a.type                            AS account_type,
+        t.dest_account_id,
+        ad.name                           AS dest_account
+    FROM transactions t
+    LEFT JOIN categories c  ON c.id  = t.category_id
+    LEFT JOIN categories cp ON cp.id = c.parent_id
+    LEFT JOIN accounts a    ON a.id  = t.account_id
+    LEFT JOIN accounts ad   ON ad.id = t.dest_account_id;
+
+    PRAGMA foreign_keys = ON;
+    `,
+  },
+  {
+    // "Due" and "paid" become different things.
+    //
+    // A fixed cost generates an occurrence when it falls due; the money only
+    // leaves when the person pays it. `status` splits the two, and it defaults to
+    // 'paid' precisely so that nothing else changes: an expense typed into the
+    // chat is already paid by the time it is typed, and every existing row is
+    // too. Only `recurring apply` ever writes 'pending'.
+    //
+    // `paid_at` is when it was settled, which is not the same as `date` (when it
+    // was due). It stays NULL for a row that was born paid — `date` already
+    // answers "when", and back-filling a timestamp we never observed would be
+    // inventing data.
+    //
+    // Plain ADD COLUMNs here, not the table rebuild of migration 2: no UNIQUE
+    // constraint changes, so SQLite can widen these tables in place.
+    version: 3,
+    sql: `
+    ALTER TABLE transactions ADD COLUMN status TEXT NOT NULL DEFAULT 'paid'
+        CHECK (status IN ('paid','pending'));
+    ALTER TABLE transactions ADD COLUMN paid_at TEXT;
+
+    -- Debited automatically by the bank (rent on direct debit, a subscription on
+    -- the card): the occurrence is posted already paid, because nobody has to do
+    -- anything for that money to leave.
+    ALTER TABLE recurring ADD COLUMN auto_debit INTEGER NOT NULL DEFAULT 0;
+
+    -- "What do I still owe" reads by user + status and sorts by due date.
+    CREATE INDEX idx_tx_user_status ON transactions(user_id, status, date);
+
+    -- The failed-attempt counter moves out of \`users\` and into \`app_state\`.
+    --
+    -- Two reasons. It had to exist before the person did, so a wrong code from an
+    -- unknown id created a permanent \`users\` row just to hold a number — junk
+    -- rows that then showed up in \`auth users\`. And a per-id counter is not a
+    -- limit on its own: the caller picks the id. A global counter lives here too,
+    -- under 'failed_attempts_global', and trips for everybody at once.
+    INSERT INTO app_state (key, value)
+    SELECT 'failed_attempts:' || telegram_user_id, CAST(failed_attempts AS TEXT)
+      FROM users WHERE failed_attempts > 0;
+    INSERT OR IGNORE INTO app_state (key, value)
+         VALUES ('failed_attempts_global', '0');
+    ALTER TABLE users DROP COLUMN failed_attempts;
+
+    DROP VIEW v_transactions;
+    CREATE VIEW v_transactions AS
+    SELECT
+        t.id, t.user_id, t.type, t.amount_cents, t.description, t.date,
+        t.status, t.paid_at,
+        t.note, t.source, t.installment_num, t.installment_total,
+        t.installment_group, t.recurring_id, t.created_at, t.updated_at,
+        t.category_id,
+        COALESCE(c.name, 'Sem categoria') AS category,
+        cp.name                           AS parent_category,
+        c.emoji                           AS category_emoji,
+        t.account_id,
+        COALESCE(a.name, 'Sem conta')     AS account,
+        a.type                            AS account_type,
+        t.dest_account_id,
+        ad.name                           AS dest_account
+    FROM transactions t
+    LEFT JOIN categories c  ON c.id  = t.category_id
+    LEFT JOIN categories cp ON cp.id = c.parent_id
+    LEFT JOIN accounts a    ON a.id  = t.account_id
+    LEFT JOIN accounts ad   ON ad.id = t.dest_account_id;
+    `,
+  },
 ];
 
 /**
@@ -676,19 +1109,22 @@ export interface SeedResult {
 }
 
 /**
- * Populates categories, the default account and initial settings.
+ * Populates one user's categories, default account and initial settings.
  *
- * Only inserts what is missing, so it never overrides something you renamed or
- * deleted.
+ * Runs at registration, not at `init`: the taxonomy is per user now, so there is
+ * nothing global left to seed. Only inserts what is missing, so it never
+ * overrides something the user renamed or deleted.
  */
-export function seed(db: Db): SeedResult {
+export function seedUser(db: Db, userId: number): SeedResult {
   const created: SeedResult = { categories: 0, subcategories: 0, accounts: 0 };
 
   transaction(db, () => {
     for (const { name, emoji, type, children } of SEED_CATEGORIES) {
       const existing = db
-        .prepare("SELECT id FROM categories WHERE parent_id IS NULL AND name = ?")
-        .get(name) as { id: number } | undefined;
+        .prepare(
+          "SELECT id FROM categories WHERE user_id = ? AND parent_id IS NULL AND name = ?",
+        )
+        .get(userId, name) as { id: number } | undefined;
 
       let parentId: number;
       if (existing) {
@@ -696,33 +1132,35 @@ export function seed(db: Db): SeedResult {
       } else {
         const info = db
           .prepare(
-            "INSERT INTO categories (name, parent_id, type, emoji) VALUES (?, NULL, ?, ?)",
+            "INSERT INTO categories (user_id, name, parent_id, type, emoji) " +
+              "VALUES (?, ?, NULL, ?, ?)",
           )
-          .run(name, type, emoji);
+          .run(userId, name, type, emoji);
         parentId = Number(info.lastInsertRowid);
         created.categories++;
       }
 
       for (const child of children) {
         const present = db
-          .prepare("SELECT 1 FROM categories WHERE name = ? AND parent_id = ?")
-          .get(child, parentId);
+          .prepare(
+            "SELECT 1 FROM categories WHERE user_id = ? AND name = ? AND parent_id = ?",
+          )
+          .get(userId, child, parentId);
         if (!present) {
           db.prepare(
-            "INSERT INTO categories (name, parent_id, type, emoji) VALUES (?, ?, ?, NULL)",
-          ).run(child, parentId, type);
+            "INSERT INTO categories (user_id, name, parent_id, type, emoji) " +
+              "VALUES (?, ?, ?, ?, NULL)",
+          ).run(userId, child, parentId, type);
           created.subcategories++;
         }
       }
     }
 
     // One default account, so logging an expense works with no setup at all.
-    if (!db.prepare("SELECT 1 FROM accounts LIMIT 1").get()) {
-      db.prepare("INSERT INTO accounts (name, type, created_at) VALUES (?, ?, ?)").run(
-        "Carteira",
-        "cash",
-        now(),
-      );
+    if (!db.prepare("SELECT 1 FROM accounts WHERE user_id = ? LIMIT 1").get(userId)) {
+      db.prepare(
+        "INSERT INTO accounts (user_id, name, type, created_at) VALUES (?, ?, ?, ?)",
+      ).run(userId, "Carteira", "cash", now());
       created.accounts++;
     }
 
@@ -731,44 +1169,335 @@ export function seed(db: Db): SeedResult {
       ["timezone", TZ],
       ["default_account", "Carteira"],
     ]) {
-      db.prepare("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)").run(
-        key,
-        value,
-      );
+      db.prepare(
+        "INSERT OR IGNORE INTO settings (user_id, key, value) VALUES (?, ?, ?)",
+      ).run(userId, key, value);
     }
   });
 
   return created;
 }
 
+/**
+ * Creates or migrates the schema. Nothing else.
+ *
+ * Seeding used to happen here; it moved to `auth login`, because categories,
+ * accounts and settings belong to a user and there is no user yet at this point.
+ */
 export function init(path?: string) {
   const db = connect(path);
   try {
     const applied = migrate(db);
-    const seeded = seed(db);
     return {
       database: path ?? DEFAULT_DB,
       schema_version: currentVersion(db),
       migrations_applied: applied,
-      seed: seeded,
     };
   } finally {
     db.close();
   }
 }
 
-export function getSetting(db: Db, key: string, fallback?: string): string | undefined {
-  const row = db.prepare("SELECT value FROM settings WHERE key = ?").get(key) as
+/* -------------------------------------------------------------------------- */
+/* Authentication                                                             */
+/* -------------------------------------------------------------------------- */
+
+export interface UserRow {
+  id: number;
+  telegram_user_id: string;
+  telegram_chat_id: string | null;
+  display_name: string | null;
+  authenticated_at: string | null;
+  auth_epoch: number;
+  active: number;
+  created_at: string;
+}
+
+/** The placeholder id migration 2 parks pre-multi-user rows under. */
+export const LEGACY_TELEGRAM_ID = "legacy";
+
+/**
+ * The access code both people type once, read from the environment.
+ *
+ * Deliberately not in the database (a backup would carry it) and not in the
+ * prompt (the model would repeat it). It is never returned, logged or echoed
+ * anywhere — including in this module's error messages.
+ */
+function configuredCode(): string {
+  const code = process.env.TALLY_ACCESS_CODE;
+  if (!code || !code.trim()) {
+    throw new FinError(
+      "O acesso ainda não foi configurado no servidor. Avise o Geovane.",
+    );
+  }
+  return code;
+}
+
+/**
+ * Whether the candidate matches the configured access code.
+ *
+ * Both sides are hashed before the comparison so the buffers are always 32
+ * bytes: `timingSafeEqual` throws on different lengths, and answering "wrong
+ * length" faster than "wrong code" would leak how long the real code is.
+ */
+export function verifyAccessCode(candidate: string): boolean {
+  const expected = createHash("sha256").update(configuredCode(), "utf8").digest();
+  const given = createHash("sha256").update(String(candidate ?? ""), "utf8").digest();
+  return timingSafeEqual(given, expected);
+}
+
+/* -- app_state: the global key/value the auth state lives in ---------------- */
+
+function appState(db: Db, key: string): string | undefined {
+  const row = db.prepare("SELECT value FROM app_state WHERE key = ?").get(key) as
     | { value: string }
     | undefined;
+  return row?.value;
+}
+
+function setAppState(db: Db, key: string, value: string): void {
+  db.prepare(
+    "INSERT INTO app_state (key, value) VALUES (?, ?) " +
+      "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+  ).run(key, value);
+}
+
+/** The global epoch. Every session below it is void. */
+export function globalAuthEpoch(db: Db): number {
+  return Number(appState(db, "auth_epoch") ?? 0);
+}
+
+export function setGlobalAuthEpoch(db: Db, epoch: number): void {
+  setAppState(db, "auth_epoch", String(epoch));
+}
+
+const GLOBAL_ATTEMPTS_KEY = "failed_attempts_global";
+const attemptsKey = (telegramUserId: string) =>
+  `failed_attempts:${String(telegramUserId)}`;
+
+/** Wrong codes recorded against one Telegram id. */
+export function failedAttempts(db: Db, telegramUserId: string): number {
+  return Number(appState(db, attemptsKey(telegramUserId)) ?? 0);
+}
+
+/** Wrong codes recorded against every id together. */
+export function globalFailedAttempts(db: Db): number {
+  return Number(appState(db, GLOBAL_ATTEMPTS_KEY) ?? 0);
+}
+
+/**
+ * Counts one wrong code, per id and globally.
+ *
+ * Both counters live in `app_state`, so a wrong code from an id nobody has ever
+ * seen leaves no `users` row behind: guessing at ids no longer populates the
+ * user list, and the id itself is all the key that is needed.
+ */
+export function recordFailedAttempt(
+  db: Db,
+  telegramUserId: string,
+): { attempts: number; global_attempts: number } {
+  const attempts = failedAttempts(db, telegramUserId) + 1;
+  const globalAttempts = globalFailedAttempts(db) + 1;
+  transaction(db, () => {
+    setAppState(db, attemptsKey(telegramUserId), String(attempts));
+    setAppState(db, GLOBAL_ATTEMPTS_KEY, String(globalAttempts));
+  });
+  return { attempts, global_attempts: globalAttempts };
+}
+
+/**
+ * Lifts the lock: clears this id's counter and the global one with it.
+ *
+ * The global counter has to go too — while it is tripped nobody can log in at
+ * all, so leaving it set would mean unlocking one person and locking everyone.
+ * Called by `auth unlock` and by a login that got the code right (knowing the
+ * code is not something a guesser can do to reset the counters).
+ */
+export function clearFailedAttempts(
+  db: Db,
+  telegramUserId: string,
+): { attempts_cleared: number; global_cleared: number } {
+  const attempts = failedAttempts(db, telegramUserId);
+  const globalAttempts = globalFailedAttempts(db);
+  transaction(db, () => {
+    db.prepare("DELETE FROM app_state WHERE key = ?").run(attemptsKey(telegramUserId));
+    setAppState(db, GLOBAL_ATTEMPTS_KEY, "0");
+  });
+  return { attempts_cleared: attempts, global_cleared: globalAttempts };
+}
+
+export function findUser(db: Db, telegramUserId: string): UserRow | undefined {
+  return db
+    .prepare("SELECT * FROM users WHERE telegram_user_id = ?")
+    .get(String(telegramUserId)) as UserRow | undefined;
+}
+
+export function listUsers(db: Db): UserRow[] {
+  return db.prepare("SELECT * FROM users ORDER BY id").all() as UserRow[];
+}
+
+/**
+ * Whether this user may act right now.
+ *
+ * `authenticated_at` has to be set — the legacy placeholder sits at epoch 0 with
+ * no timestamp precisely so it does not slip through while the global epoch is
+ * still 0 — and the session must not predate the last `logout-all`.
+ */
+export function isSessionCurrent(user: UserRow, epoch: number): boolean {
+  return (
+    user.active === 1 && user.authenticated_at !== null && user.auth_epoch >= epoch
+  );
+}
+
+/**
+ * Whether this id may still try a code.
+ *
+ * Two ways to be locked: this id burned its five attempts, or the ids together
+ * burned twenty. Keyed by Telegram id rather than by `users` row, because the
+ * counter has to exist for ids that have no row.
+ */
+export function isLockedOut(db: Db, telegramUserId: string): boolean {
+  return (
+    globalFailedAttempts(db) >= MAX_GLOBAL_FAILED_ATTEMPTS ||
+    failedAttempts(db, telegramUserId) >= MAX_FAILED_ATTEMPTS
+  );
+}
+
+/** Whether everybody is locked out, whatever id they claim. */
+export function isGloballyLocked(db: Db): boolean {
+  return globalFailedAttempts(db) >= MAX_GLOBAL_FAILED_ATTEMPTS;
+}
+
+/* -- The legacy ledger ------------------------------------------------------ */
+
+/** Every table keyed by `user_id`, ordered so deletes respect the foreign keys. */
+const PER_USER_TABLES: readonly string[] = [
+  "transactions",
+  "recurring",
+  "budgets",
+  "goals",
+  "tags",
+  "sent_alerts",
+  "settings",
+  "categories",
+  "accounts",
+];
+
+export interface AdoptLegacyResult {
+  telegram_user_id: string;
+  user_id: number;
+  created_user: boolean;
+  moved: Record<string, number>;
+  discarded: number;
+}
+
+/**
+ * Hands the pre-multi-user rows to a real person.
+ *
+ * Migration 2 parked everything that already existed under a `legacy`
+ * placeholder. Nothing could ever claim it: logging in creates a *new* user with
+ * an empty ledger, and the placeholder itself can never authenticate. This is the
+ * step that closes that gap, and it is deliberately not something a chat turn can
+ * trigger — see `requireOperator` in `fin.ts`.
+ *
+ * The target must not already have transactions of its own. Two real histories
+ * cannot be merged safely: `accounts`, `categories`, `tags`, `goals` and
+ * `settings` are all UNIQUE per user and name, so the merge would have to invent
+ * renamed duplicates of somebody's taxonomy. Refusing is the honest answer.
+ *
+ * A target that has only ever been seeded (categories, "Carteira", settings, and
+ * no transactions) is the normal case, and those seeded rows are dropped so the
+ * adopted names have somewhere to land. They come back on the next login, which
+ * fills in whatever the old ledger was missing.
+ */
+export function adoptLegacy(db: Db, telegramUserId: string): AdoptLegacyResult {
+  const legacy = findUser(db, LEGACY_TELEGRAM_ID);
+  if (!legacy) {
+    throw new FinError(
+      "Não há histórico antigo para adotar: nenhum usuário 'legacy' neste banco.",
+    );
+  }
+
+  return transaction(db, () => {
+    const existing = findUser(db, telegramUserId);
+    let userId: number;
+    let discarded = 0;
+
+    if (existing) {
+      const own = db
+        .prepare("SELECT COUNT(*) AS n FROM transactions WHERE user_id = ?")
+        .get(existing.id) as { n: number };
+      if (Number(own.n) > 0) {
+        throw new FinError(
+          `O usuário ${telegramUserId} já tem lançamentos próprios, então não vou ` +
+            "juntar dois históricos num só. Adote o histórico antigo em uma conta " +
+            "sem lançamentos.",
+        );
+      }
+      userId = existing.id;
+      // Only seed data can be here (no transactions), and it would collide with
+      // the adopted names on every UNIQUE (user_id, name).
+      for (const table of PER_USER_TABLES) {
+        discarded += Number(
+          db.prepare(`DELETE FROM ${table} WHERE user_id = ?`).run(userId).changes,
+        );
+      }
+    } else {
+      // Unauthenticated on purpose: adopting the rows does not let anybody in.
+      // That person still types the code once, and the login finds the history
+      // already waiting.
+      const info = db
+        .prepare(
+          "INSERT INTO users (telegram_user_id, telegram_chat_id, display_name," +
+            " authenticated_at, auth_epoch, active, created_at)" +
+            " VALUES (?, NULL, ?, NULL, 0, 1, ?)",
+        )
+        .run(telegramUserId, legacy.display_name, now());
+      userId = Number(info.lastInsertRowid);
+    }
+
+    const moved: Record<string, number> = {};
+    for (const table of PER_USER_TABLES) {
+      moved[table] = Number(
+        db
+          .prepare(`UPDATE ${table} SET user_id = ? WHERE user_id = ?`)
+          .run(userId, legacy.id).changes,
+      );
+    }
+
+    db.prepare("DELETE FROM users WHERE id = ?").run(legacy.id);
+
+    return {
+      telegram_user_id: telegramUserId,
+      user_id: userId,
+      created_user: existing === undefined,
+      moved,
+      discarded,
+    };
+  });
+}
+
+/* -------------------------------------------------------------------------- */
+/* Per-user data access                                                       */
+/* -------------------------------------------------------------------------- */
+
+export function getSetting(
+  db: Db,
+  userId: number,
+  key: string,
+  fallback?: string,
+): string | undefined {
+  const row = db
+    .prepare("SELECT value FROM settings WHERE user_id = ? AND key = ?")
+    .get(userId, key) as { value: string } | undefined;
   return row ? row.value : fallback;
 }
 
-export function setSetting(db: Db, key: string, value: string): void {
+export function setSetting(db: Db, userId: number, key: string, value: string): void {
   db.prepare(
-    "INSERT INTO settings (key, value) VALUES (?, ?) " +
-      "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-  ).run(key, value);
+    "INSERT INTO settings (user_id, key, value) VALUES (?, ?, ?) " +
+      "ON CONFLICT(user_id, key) DO UPDATE SET value = excluded.value",
+  ).run(userId, key, value);
 }
 
 interface CategoryRow {
@@ -787,6 +1516,7 @@ interface CategoryRow {
  */
 export function resolveCategory(
   db: Db,
+  userId: number,
   name?: string | null,
   create = false,
 ): number | null {
@@ -794,8 +1524,8 @@ export function resolveCategory(
 
   const target = normalize(String(name));
   const rows = db
-    .prepare("SELECT id, name, parent_id FROM categories WHERE active = 1")
-    .all() as CategoryRow[];
+    .prepare("SELECT id, name, parent_id FROM categories WHERE user_id = ? AND active = 1")
+    .all(userId) as CategoryRow[];
 
   const exact = rows.filter((r) => normalize(r.name) === target);
   if (exact.length) {
@@ -823,11 +1553,15 @@ export function resolveCategory(
 
   if (create) {
     const parent = db
-      .prepare("SELECT id FROM categories WHERE name = 'Outros' AND parent_id IS NULL")
-      .get() as { id: number } | undefined;
+      .prepare(
+        "SELECT id FROM categories WHERE user_id = ? AND name = 'Outros' AND parent_id IS NULL",
+      )
+      .get(userId) as { id: number } | undefined;
     const info = db
-      .prepare("INSERT INTO categories (name, parent_id, type) VALUES (?, ?, 'both')")
-      .run(String(name).trim().slice(0, 60), parent ? parent.id : null);
+      .prepare(
+        "INSERT INTO categories (user_id, name, parent_id, type) VALUES (?, ?, ?, 'both')",
+      )
+      .run(userId, String(name).trim().slice(0, 60), parent ? parent.id : null);
     return Number(info.lastInsertRowid);
   }
 
@@ -839,24 +1573,27 @@ export function resolveCategory(
 /** Finds an account by name; with no name, falls back to the default account. */
 export function resolveAccount(
   db: Db,
+  userId: number,
   name?: string | null,
   useDefault = true,
 ): number | null {
   if (!name || !String(name).trim()) {
     if (!useDefault) return null;
-    const fallback = getSetting(db, "default_account", "Carteira")!;
+    const fallback = getSetting(db, userId, "default_account", "Carteira")!;
     const row = db
-      .prepare("SELECT id FROM accounts WHERE name = ? AND active = 1")
-      .get(fallback) as { id: number } | undefined;
+      .prepare("SELECT id FROM accounts WHERE user_id = ? AND name = ? AND active = 1")
+      .get(userId, fallback) as { id: number } | undefined;
     if (row) return row.id;
     const any = db
-      .prepare("SELECT id FROM accounts WHERE active = 1 ORDER BY id LIMIT 1")
-      .get() as { id: number } | undefined;
+      .prepare("SELECT id FROM accounts WHERE user_id = ? AND active = 1 ORDER BY id LIMIT 1")
+      .get(userId) as { id: number } | undefined;
     return any ? any.id : null;
   }
 
   const target = normalize(String(name));
-  const rows = db.prepare("SELECT id, name FROM accounts WHERE active = 1").all() as {
+  const rows = db
+    .prepare("SELECT id, name FROM accounts WHERE user_id = ? AND active = 1")
+    .all(userId) as {
     id: number;
     name: string;
   }[];
@@ -883,14 +1620,19 @@ export function resolveAccount(
 }
 
 /** `Food > Delivery`, for display. */
-export function fullCategoryName(db: Db, categoryId?: number | null): string {
+export function fullCategoryName(
+  db: Db,
+  userId: number,
+  categoryId?: number | null,
+): string {
   if (!categoryId) return "Sem categoria";
   const row = db
     .prepare(
       "SELECT c.name AS name, p.name AS parent FROM categories c " +
-        "LEFT JOIN categories p ON p.id = c.parent_id WHERE c.id = ?",
+        "LEFT JOIN categories p ON p.id = c.parent_id " +
+        "WHERE c.id = ? AND c.user_id = ?",
     )
-    .get(categoryId) as { name: string; parent: string | null } | undefined;
+    .get(categoryId, userId) as { name: string; parent: string | null } | undefined;
   if (!row) return "Sem categoria";
   return row.parent ? `${row.parent} > ${row.name}` : row.name;
 }
@@ -901,34 +1643,54 @@ export function fullCategoryName(db: Db, categoryId?: number | null): string {
  * Filtering by "Food" has to include what was logged under "Delivery", or a
  * budget on the parent would never add up to the sum of its parts.
  */
-export function categoryAndChildrenIds(db: Db, categoryId: number): number[] {
+export function categoryAndChildrenIds(
+  db: Db,
+  userId: number,
+  categoryId: number,
+): number[] {
   const children = db
-    .prepare("SELECT id FROM categories WHERE parent_id = ?")
-    .all(categoryId) as { id: number }[];
+    .prepare("SELECT id FROM categories WHERE user_id = ? AND parent_id = ?")
+    .all(userId, categoryId) as { id: number }[];
   return [categoryId, ...children.map((r) => r.id)];
 }
 
-export function tagsOf(db: Db, transactionId: number): string[] {
+export function tagsOf(db: Db, userId: number, transactionId: number): string[] {
   const rows = db
     .prepare(
       "SELECT t.name FROM tags t JOIN transaction_tags tt ON tt.tag_id = t.id " +
-        "WHERE tt.transaction_id = ? ORDER BY t.name",
+        "WHERE tt.transaction_id = ? AND t.user_id = ? ORDER BY t.name",
     )
-    .all(transactionId) as { name: string }[];
+    .all(transactionId, userId) as { name: string }[];
   return rows.map((r) => r.name);
 }
 
 /** Replaces a transaction's tags. */
-export function applyTags(db: Db, transactionId: number, tags: string[]): void {
+export function applyTags(
+  db: Db,
+  userId: number,
+  transactionId: number,
+  tags: string[],
+): void {
+  // The callers already checked ownership; checking again here is cheap and this
+  // is the one function that writes through a join table, where a wrong id would
+  // be invisible.
+  const owned = db
+    .prepare("SELECT 1 FROM transactions WHERE id = ? AND user_id = ?")
+    .get(transactionId, userId);
+  if (!owned) throw new FinError(`Não achei o lançamento #${transactionId}.`);
+
   transaction(db, () => {
     db.prepare("DELETE FROM transaction_tags WHERE transaction_id = ?").run(transactionId);
     for (const tag of tags) {
       const name = String(tag).trim().replace(/^#/, "");
       if (!name) continue;
-      db.prepare("INSERT OR IGNORE INTO tags (name) VALUES (?)").run(name);
-      const row = db.prepare("SELECT id FROM tags WHERE name = ?").get(name) as {
-        id: number;
-      };
+      db.prepare("INSERT OR IGNORE INTO tags (user_id, name) VALUES (?, ?)").run(
+        userId,
+        name,
+      );
+      const row = db
+        .prepare("SELECT id FROM tags WHERE user_id = ? AND name = ?")
+        .get(userId, name) as { id: number };
       db.prepare(
         "INSERT OR IGNORE INTO transaction_tags (transaction_id, tag_id) VALUES (?, ?)",
       ).run(transactionId, row.id);
@@ -938,10 +1700,13 @@ export function applyTags(db: Db, transactionId: number, tags: string[]): void {
 
 export interface TransactionRow {
   id: number;
+  user_id: number;
   type: TransactionType;
   amount_cents: number;
   description: string;
   date: string;
+  status: TransactionStatus;
+  paid_at: string | null;
   note: string | null;
   source: string;
   installment_num: number | null;
@@ -970,12 +1735,16 @@ export interface TransactionOut extends TransactionRow {
 }
 
 /** A view row turned into the object the agent reads as JSON. */
-export function serializeTransaction(db: Db, row: TransactionRow): TransactionOut {
+export function serializeTransaction(
+  db: Db,
+  userId: number,
+  row: TransactionRow,
+): TransactionOut {
   const out: TransactionOut = {
     ...row,
     amount: row.amount_cents / 100,
     amount_fmt: formatMoney(row.amount_cents),
-    tags: tagsOf(db, row.id),
+    tags: tagsOf(db, userId, row.id),
     full_category: row.parent_category
       ? `${row.parent_category} > ${row.category}`
       : row.category,

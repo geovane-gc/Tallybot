@@ -5,8 +5,9 @@
  * the bot be validated before there is an OpenRouter key or a Telegram token.
  *
  * The focus is where a bug would corrupt months of data without showing up:
- * cent arithmetic, calendar boundaries, category hierarchy inside budgets, and
- * idempotency of recurring entries.
+ * cent arithmetic, calendar boundaries, category hierarchy inside budgets,
+ * idempotency of recurring entries — and, since two people share the database,
+ * that neither of them can ever see or touch the other's money.
  *
  *     node --test tests/fin.test.ts
  */
@@ -14,6 +15,7 @@
 import { describe, test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { DatabaseSync } from "node:sqlite";
 import { mkdtempSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
@@ -38,21 +40,67 @@ interface Response {
   ok: boolean;
   error?: string;
   _exit: number;
+  /** Everything the process wrote to stderr, kept so leak tests can inspect it. */
+  _stderr: string;
   [k: string]: unknown;
 }
 
+/** The access code, handed to the subprocess the way production does. */
+const CODE = "codigo-de-teste-longo-e-aleatorio-Xy7Q";
+const USER_A = "111111111";
+const USER_B = "222222222";
+
 /**
- * Runs the CLI the way the agent runs it — as a subprocess.
+ * Runs the CLI as a subprocess, with the environment fully under our control.
  *
  * Testing through the process rather than importing the functions is what keeps
- * the output contract and the exit codes covered too.
+ * the output contract, the exit codes and — now that identity comes from the
+ * environment — the auth gate covered too.
  */
-function run(db: string, ...args: string[]): Response {
+function spawn(
+  db: string,
+  args: string[],
+  env: Record<string, string | undefined> = {},
+): Response {
+  const merged: Record<string, string | undefined> = {
+    ...process.env,
+    TALLY_ACCESS_CODE: CODE,
+  };
+  for (const [key, value] of Object.entries(env)) {
+    if (value === undefined) delete merged[key];
+    else merged[key] = value;
+  }
   const proc = spawnSync(process.execPath, [CLI, "--db", db, ...args], {
     encoding: "utf8",
+    env: merged as NodeJS.ProcessEnv,
   });
   assert.ok(proc.stdout, `no output. stderr: ${proc.stderr}`);
-  return { ...JSON.parse(proc.stdout), _exit: proc.status ?? -1 };
+  return {
+    ...JSON.parse(proc.stdout),
+    _exit: proc.status ?? -1,
+    _stderr: proc.stderr ?? "",
+  };
+}
+
+/**
+ * The default caller for tests that are not about identity.
+ *
+ * There is no Hermes session here, so `--user` is the way in; it is filled in
+ * with user A unless the test named someone itself.
+ *
+ * Worth being explicit about: because no `HERMES_SESSION_*` variable is set,
+ * every test that goes through here runs on the **operator path** — the same one
+ * the Makefile and cron use. That is deliberate (it is the only way to act as two
+ * people from one process) but it means these tests say nothing about what a chat
+ * turn can do. The "who is calling" suite covers that side on purpose, with the
+ * session environment set.
+ */
+function run(db: string, ...args: string[]): Response {
+  const scoped =
+    args[0] !== "init" && args[0] !== "auth" && !args.includes("--user")
+      ? [...args, "--user", USER_A]
+      : args;
+  return spawn(db, scoped);
 }
 
 function ok(db: string, ...args: string[]): Response {
@@ -69,12 +117,42 @@ function fails(db: string, ...args: string[]): string {
   return r.error!;
 }
 
-/** A fresh, initialised database. */
-function freshDb(): string {
+function login(db: string, user: string, name?: string): Response {
+  const args = ["auth", "login", "--user", user, "--code", CODE];
+  if (name) args.push("--name", name);
+  return ok(db, ...args);
+}
+
+/** An empty database with only the schema in it. */
+function emptyDb(): string {
   const dir = mkdtempSync(join(tmpdir(), "tally-test-"));
   const path = join(dir, "tally.db");
   ok(path, "init");
   return path;
+}
+
+/** A fresh database with user A authenticated and seeded. */
+function freshDb(): string {
+  const path = emptyDb();
+  login(path, USER_A, "Geovane");
+  return path;
+}
+
+/** A fresh database with both people authenticated. */
+function sharedDb(): string {
+  const path = freshDb();
+  login(path, USER_B, "Namorada");
+  return path;
+}
+
+/**
+ * A destination `export` will accept.
+ *
+ * `--dest` has to resolve inside the database's own directory, so a scratch
+ * directory somewhere else under /tmp is refused on purpose.
+ */
+function exportDir(db: string, name = "exports"): string {
+  return join(dirname(db), name);
 }
 
 const tx = (r: Response) => r.transaction as Record<string, never>;
@@ -110,6 +188,29 @@ describe("amounts", () => {
       assert.throws(() => parseAmount(bad), FinError);
     });
   }
+
+  // Non-finite and absurd values. `1e307` parses as a number, then overflows to
+  // Infinity once multiplied by 100, and used to reach SQLite — the user got
+  // "NOT NULL constraint failed: transactions.amount_cents" in their chat.
+  for (const bad of ["1e307", "1e400", 1e307, Infinity, -Infinity, NaN, "9e15"]) {
+    test(`rejects the non-finite or absurd ${String(bad)}`, () => {
+      assert.throws(() => parseAmount(bad), FinError);
+    });
+  }
+
+  test("the ceiling is a real amount, not a magic number", () => {
+    // R$ 100.000.000,00 goes through; one cent more does not.
+    assert.equal(parseAmount("100000000"), 10_000_000_000);
+    assert.throws(() => parseAmount("100000000,01"), FinError);
+  });
+
+  test("an absurd amount fails with Portuguese, not with SQL", () => {
+    const db = freshDb();
+    const message = fails(db, "add", "--amount", "1e307", "--description", "x");
+    assert.match(message, /valor/i);
+    assert.doesNotMatch(message, /constraint|NOT NULL|SQL/i);
+    assert.equal(ok(db, "ls", "--period", "all").total_count, 0);
+  });
 
   const formats: [number, string][] = [
     [0, "R$ 0,00"],
@@ -608,16 +709,33 @@ describe("reports", () => {
 describe("recurring", () => {
   test("apply is idempotent", () => {
     // Running twice in the same day must not duplicate the rent.
+    //
+    // The day has to be *today*: with yesterday's day-of-month, `nextOccurrence`
+    // schedules the charge for next month, `apply` generates nothing, and the test
+    // ends up asserting that 0 equals 0 — which it did for a while.
     const db = freshDb();
-    const yesterday = addDays(today(), -1);
     ok(db, "recurring", "add", "--description", "Aluguel", "--amount", "1500",
-      "--category", "Aluguel", "--day", yesterday.slice(8));
+      "--category", "Aluguel", "--day", today().slice(8));
 
     const first = ok(db, "recurring", "apply");
+    assert.equal(first.count, 1, "the first run generated nothing to be idempotent about");
+    assert.equal(first.silent, false);
+
     const second = ok(db, "recurring", "apply");
     assert.equal(second.count, 0);
     assert.equal(second.silent, true);
-    assert.equal(ok(db, "ls", "--period", "all").total_count, first.count);
+    assert.equal(ok(db, "ls", "--period", "all").total_count, 1);
+  });
+
+  test("apply is idempotent with --auto-debit too", () => {
+    const db = freshDb();
+    ok(db, "recurring", "add", "--description", "Netflix", "--amount", "44,90",
+      "--category", "Streaming", "--day", today().slice(8), "--auto-debit");
+    assert.equal(ok(db, "recurring", "apply").count, 1);
+    assert.equal(ok(db, "recurring", "apply").count, 0);
+    const rows = ok(db, "ls", "--period", "all").transactions as { status: string }[];
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].status, "paid");
   });
 
   test("adding one does not backfill the current period", () => {
@@ -646,6 +764,453 @@ describe("recurring", () => {
       "--category", "Streaming", "--day", "3");
     ok(db, "recurring", "rm", "--id", String(r.id));
     assert.equal(ok(db, "recurring", "list").count, 0);
+  });
+});
+
+describe("paid and pending", () => {
+  /** A fixed cost due today, so `apply` has something to generate on any day. */
+  function withRent(db: string, ...extra: string[]): void {
+    ok(db, "recurring", "add", "--description", "Aluguel", "--amount", "1500",
+      "--category", "Aluguel", "--day", today().slice(8), ...extra);
+  }
+
+  const pendingOf = (r: Response) => r.pending as Record<string, never>[];
+
+  interface AccountView {
+    name: string;
+    balance_cents: number;
+    pending_cents: number;
+    pending_fmt: string;
+  }
+  const account = (r: Response, name: string) =>
+    (r.accounts as unknown as AccountView[]).find((c) => c.name === name)!;
+
+  test("an occurrence is born pending, and paying it is the whole lifecycle", () => {
+    const db = freshDb();
+    withRent(db);
+
+    const applied = ok(db, "recurring", "apply");
+    assert.equal(applied.count, 1);
+    assert.equal(applied.pending_count, 1);
+    const id = (applied.generated as { id: number; status: string }[])[0].id;
+    assert.equal((applied.generated as { status: string }[])[0].status, "pending");
+
+    const listed = ok(db, "recurring", "pending");
+    assert.equal(listed.count, 1);
+    assert.equal(listed.total_fmt, "R$ 1.500,00");
+    assert.equal(listed.silent, false);
+    assert.equal(pendingOf(listed)[0].id, id);
+    assert.equal(pendingOf(listed)[0].days_overdue, 0);
+
+    const paid = ok(db, "recurring", "pay", String(id));
+    assert.equal(paid.action, "paid");
+    assert.equal(tx(paid).status, "paid");
+    assert.ok(tx(paid).paid_at, "paid_at was not recorded");
+    assert.equal(paid.amount_changed, false);
+
+    assert.equal(ok(db, "recurring", "pending").count, 0);
+    assert.equal(ok(db, "recurring", "pending").silent, true);
+
+    // And undoing it puts it back.
+    const undone = ok(db, "recurring", "unpay", String(id));
+    assert.equal(tx(undone).status, "pending");
+    assert.equal(tx(undone).paid_at, null);
+    assert.equal(ok(db, "recurring", "pending").count, 1);
+  });
+
+  test("a pending bill stays out of the balance but counts against the budget", () => {
+    // The decision the owner made: the balance is real cash, the budget is what he
+    // has committed. So the rent shows up in one and not the other.
+    const db = freshDb();
+    ok(db, "budget", "set", "--category", "Moradia", "--limit", "2000");
+    ok(db, "add", "--type", "income", "--amount", "5000", "--description", "Salário",
+      "--category", "Salário");
+    withRent(db);
+    ok(db, "recurring", "apply");
+
+    const wallet = account(ok(db, "balance"), "Carteira");
+    assert.equal(wallet.balance_cents, 500000, "the pending rent moved the balance");
+    assert.equal(wallet.pending_cents, 150000);
+    assert.equal(wallet.pending_fmt, "R$ 1.500,00");
+    assert.equal(ok(db, "balance").total_pending_fmt, "R$ 1.500,00");
+
+    const b = (ok(db, "budget", "status").budgets as Record<string, never>[])[0];
+    assert.equal(b.spent_cents, 0, "spent must be paid money only");
+    assert.equal(b.pending_cents, 150000);
+    assert.equal(b.committed_cents, 150000);
+    assert.equal(b.pct, 75);
+    assert.equal(b.status, "ok");
+
+    // Reports: the headline is paid, pending is its own block.
+    const summary = ok(db, "summary", "--period", "month");
+    assert.equal(summary.expenses_cents, 0);
+    assert.equal(summary.pending_cents, 150000);
+    assert.equal(summary.count, 2);
+
+    // Paying it moves the money and leaves the budget where it was.
+    const id = (ok(db, "recurring", "pending").pending as { id: number }[])[0].id;
+    ok(db, "recurring", "pay", String(id));
+    const after = account(ok(db, "balance"), "Carteira");
+    assert.equal(after.balance_cents, 350000);
+    assert.equal(after.pending_cents, 0);
+    const b2 = (ok(db, "budget", "status").budgets as Record<string, never>[])[0];
+    assert.equal(b2.spent_cents, 150000);
+    assert.equal(b2.committed_cents, 150000);
+    assert.equal(b2.pct, 75);
+    assert.equal(ok(db, "summary", "--period", "month").expenses_cents, 150000);
+  });
+
+  test("a budget in trouble says how much of it is still to pay", () => {
+    const db = freshDb();
+    ok(db, "budget", "set", "--category", "Moradia", "--limit", "1600");
+    ok(db, "add", "--amount", "100", "--description", "Luz", "--category", "Luz");
+    withRent(db);
+    ok(db, "recurring", "apply");
+
+    const alert = (ok(db, "alerts").alerts as { message: string; level: string }[])[0];
+    assert.equal(alert.level, "over");
+    assert.match(alert.message, /R\$ 1\.600,00/);
+    assert.match(alert.message, /R\$ 1\.500,00 disso ainda a pagar/);
+
+    const text = ok(db, "report", "--period", "month").text as string;
+    assert.match(text, /\*A pagar:\* R\$ 1\.500,00/);
+    assert.match(text, /⏳ Aluguel/);
+    assert.match(text, /ainda a pagar/);
+    // Gastos is paid money only.
+    assert.match(text, /💸 Gastos: \*R\$ 100,00\*/);
+  });
+
+  test("--auto-debit posts the occurrence already paid", () => {
+    const db = freshDb();
+    withRent(db, "--auto-debit");
+    const applied = ok(db, "recurring", "apply");
+    assert.equal((applied.generated as { status: string }[])[0].status, "paid");
+    assert.equal(applied.pending_count, 0);
+    assert.equal(ok(db, "recurring", "pending").count, 0);
+    // It is real spending straight away, and it did move the balance.
+    assert.equal(ok(db, "summary", "--period", "month").expenses_cents, 150000);
+    const wallet = account(ok(db, "balance"), "Carteira");
+    assert.equal(wallet.balance_cents, -150000);
+    assert.equal(wallet.pending_cents, 0);
+
+    const listed = (ok(db, "recurring", "list").recurring as { auto_debit: number }[])[0];
+    assert.equal(listed.auto_debit, 1);
+  });
+
+  test("an income occurrence is never pending", () => {
+    // Nobody has to pay their own salary in, so there is nothing to settle.
+    const db = freshDb();
+    ok(db, "recurring", "add", "--description", "Salário", "--amount", "7000",
+      "--type", "income", "--category", "Salário", "--day", today().slice(8));
+    const applied = ok(db, "recurring", "apply");
+    assert.equal((applied.generated as { status: string }[])[0].status, "paid");
+    assert.equal(ok(db, "summary", "--period", "month").income_cents, 700000);
+  });
+
+  test("--amount on payment is respected, and the difference is reported", () => {
+    // A light bill is never the same twice.
+    const db = freshDb();
+    ok(db, "recurring", "add", "--description", "Luz", "--amount", "180",
+      "--category", "Luz", "--day", today().slice(8));
+    ok(db, "recurring", "apply");
+    const id = (ok(db, "recurring", "pending").pending as { id: number }[])[0].id;
+
+    const paid = ok(db, "recurring", "pay", String(id), "--amount", "212,40");
+    assert.equal(tx(paid).amount_cents, 21240);
+    assert.equal(paid.amount_changed, true);
+    assert.equal(paid.expected_fmt, "R$ 180,00");
+    assert.equal(paid.difference_fmt, "R$ 32,40");
+    assert.match(paid.message as string, /acima do previsto/);
+    assert.equal(ok(db, "summary", "--period", "month").expenses_cents, 21240);
+  });
+
+  test("paying below the estimate reads as below", () => {
+    const db = freshDb();
+    ok(db, "recurring", "add", "--description", "Água", "--amount", "120",
+      "--category", "Água", "--day", today().slice(8));
+    ok(db, "recurring", "apply");
+    const id = (ok(db, "recurring", "pending").pending as { id: number }[])[0].id;
+    const paid = ok(db, "recurring", "pay", String(id), "--amount", "98");
+    assert.match(paid.message as string, /abaixo do previsto/);
+    assert.equal(paid.difference_fmt, "-R$ 22,00");
+  });
+
+  test("--date records when it was paid and leaves the due date alone", () => {
+    // A bill paid late still belongs to the month it was due in; moving `date`
+    // would rewrite that month's report.
+    const db = freshDb();
+    withRent(db);
+    ok(db, "recurring", "apply");
+    const id = (ok(db, "recurring", "pending").pending as { id: number }[])[0].id;
+    const due = (ok(db, "recurring", "pending").pending as { date: string }[])[0].date;
+
+    const paid = ok(db, "recurring", "pay", String(id), "--date", "hoje");
+    assert.equal(tx(paid).date, due);
+    assert.equal(tx(paid).paid_at, today());
+  });
+
+  test("paying twice, and unpaying what was never pending", () => {
+    const db = freshDb();
+    withRent(db);
+    ok(db, "recurring", "apply");
+    const id = (ok(db, "recurring", "pending").pending as { id: number }[])[0].id;
+
+    ok(db, "recurring", "pay", String(id));
+    assert.match(fails(db, "recurring", "pay", String(id)), /já está pago/);
+    ok(db, "recurring", "unpay", String(id));
+    assert.match(fails(db, "recurring", "unpay", String(id)), /já está marcado/);
+  });
+
+  test("a one-off expense cannot be turned into a bill to pay", () => {
+    // It was paid by definition — the money is gone. Letting `unpay` reach it
+    // would take cash out of the balance that is genuinely spent.
+    const db = freshDb();
+    const created = ok(db, "add", "--amount", "27", "--description", "Uber");
+    assert.match(fails(db, "recurring", "unpay", String(created.id)), /não é uma conta fixa/);
+    assert.equal(
+      (ok(db, "ls", "--period", "all").transactions as { status: string }[])[0].status,
+      "paid",
+    );
+  });
+
+  test("pay and unpay need an id", () => {
+    const db = freshDb();
+    assert.match(fails(db, "recurring", "pay"), /id do lançamento/);
+    assert.match(fails(db, "recurring", "unpay", "abc"), /id do lançamento/);
+    assert.match(fails(db, "recurring", "pay", "999"), /#999/);
+  });
+
+  test("recurring due reads the schedule, before any occurrence exists", () => {
+    // The day before a bill falls due there is no transaction yet — `apply` only
+    // creates it on the day. A reminder that waited for the row would always be a
+    // day late, so `due` reads `recurring.next_date` instead.
+    const db = freshDb();
+    const tomorrow = addDays(today(), 1);
+    const created = ok(db, "recurring", "add", "--description", "Internet",
+      "--amount", "119,90", "--category", "Internet", "--day", tomorrow.slice(8));
+    // Asserted rather than assumed: `--day <tomorrow's day>` resolves to tomorrow
+    // on every day of every month, including the last one (where it rolls into the
+    // next month and still lands on tomorrow).
+    assert.equal(created.next_date, tomorrow);
+
+    // Nothing has been generated: the ledger is empty.
+    assert.equal(ok(db, "ls", "--period", "all").total_count, 0);
+    assert.equal(ok(db, "recurring", "pending").count, 0);
+
+    const due = ok(db, "recurring", "due");
+    assert.equal(due.count, 1);
+    assert.equal(due.silent, false);
+    assert.equal(due.total_fmt, "R$ 119,90");
+    const item = (due.due as Record<string, never>[])[0];
+    assert.equal(item.description, "Internet");
+    assert.equal(item.due_date, tomorrow);
+    assert.equal(item.days_until, 1);
+    assert.equal(item.auto_debit, false);
+    assert.equal(item.amount_fmt, "R$ 119,90");
+  });
+
+  test("recurring due is silent when nothing is close, and --in widens the window", () => {
+    const db = freshDb();
+    const target = addDays(today(), 20);
+    const created = ok(db, "recurring", "add", "--description", "IPTU", "--amount", "300",
+      "--category", "IPTU", "--day", target.slice(8));
+    assert.equal(created.next_date, target);
+
+    const soon = ok(db, "recurring", "due");
+    assert.equal(soon.count, 0);
+    assert.equal(soon.silent, true);
+
+    const wide = ok(db, "recurring", "due", "--in", "30");
+    assert.equal(wide.count, 1);
+    assert.equal((wide.due as { days_until: number }[])[0].days_until, 20);
+  });
+
+  test("recurring due reports auto-debit, since nobody has to act on those", () => {
+    const db = freshDb();
+    withRent(db, "--auto-debit");
+    const item = (ok(db, "recurring", "due", "--in", "0").due as { auto_debit: boolean }[])[0];
+    assert.equal(item.auto_debit, true);
+  });
+
+  test("an invalid --in is refused", () => {
+    assert.match(fails(freshDb(), "recurring", "due", "--in", "9999"), /--in/);
+  });
+
+  test("ls --status filters, and every row carries its status", () => {
+    const db = freshDb();
+    ok(db, "add", "--amount", "27", "--description", "Uber");
+    withRent(db);
+    ok(db, "recurring", "apply");
+
+    const all = ok(db, "ls", "--period", "all");
+    assert.equal(all.total_count, 2, "the default has to show both");
+    assert.equal(all.pending_fmt, "R$ 1.500,00");
+    const statuses = (all.transactions as { status: string }[]).map((t) => t.status).sort();
+    assert.deepEqual(statuses, ["paid", "pending"]);
+
+    assert.equal(ok(db, "ls", "--period", "all", "--status", "pending").total_count, 1);
+    assert.equal(ok(db, "ls", "--period", "all", "--status", "paid").total_count, 1);
+    assert.equal(ok(db, "ls", "--period", "all", "--status", "all").total_count, 2);
+    assert.match(fails(db, "ls", "--status", "quitado"), /Status inválido/);
+  });
+
+  test("an overdue bill says how many days late it is", () => {
+    const db = freshDb();
+    withRent(db);
+    ok(db, "recurring", "apply");
+    const id = (ok(db, "recurring", "pending").pending as { id: number }[])[0].id;
+    // Backdated to yesterday, as if it had fallen due then and gone unpaid.
+    ok(db, "edit", String(id), "--date", "ontem");
+
+    const bill = (ok(db, "recurring", "pending").pending as
+      { days_overdue: number; overdue: boolean; status: string }[])[0];
+    assert.equal(bill.days_overdue, 1);
+    assert.equal(bill.overdue, true);
+    // Editing a field must not quietly settle it.
+    assert.equal(bill.status, "pending");
+
+    assert.match(ok(db, "report", "--period", "30d").text as string, /1 dia em atraso/);
+  });
+
+  test("neither payment nor pending crosses between the two people", () => {
+    const db = sharedDb();
+    withRent(db);
+    ok(db, "recurring", "add", "--description", "Academia", "--amount", "120",
+      "--category", "Academia", "--day", today().slice(8), "--user", USER_B);
+    ok(db, "recurring", "apply");
+    ok(db, "recurring", "apply", "--user", USER_B);
+
+    const mine = ok(db, "recurring", "pending");
+    const hers = ok(db, "recurring", "pending", "--user", USER_B);
+    assert.equal(mine.count, 1);
+    assert.equal(hers.count, 1);
+    assert.ok(!JSON.stringify(mine).includes("Academia"));
+
+    const hersId = (hers.pending as { id: number }[])[0].id;
+    // The same non-revealing message an id that never existed gets.
+    assert.match(fails(db, "recurring", "pay", String(hersId)), new RegExp(`#${hersId}`));
+    assert.match(fails(db, "recurring", "unpay", String(hersId)), new RegExp(`#${hersId}`));
+    // Untouched, and still hers to pay.
+    assert.equal(ok(db, "recurring", "pending", "--user", USER_B).count, 1);
+    ok(db, "recurring", "pay", String(hersId), "--user", USER_B);
+    assert.equal(ok(db, "recurring", "pending", "--user", USER_B).count, 0);
+    // Her payment did not settle mine.
+    assert.equal(ok(db, "recurring", "pending").count, 1);
+  });
+
+  test("due only reads your own schedule", () => {
+    const db = sharedDb();
+    withRent(db, "--auto-debit");
+    assert.equal(ok(db, "recurring", "due", "--in", "0").count, 1);
+    assert.equal(ok(db, "recurring", "due", "--in", "0", "--user", USER_B).count, 0);
+    assert.equal(ok(db, "recurring", "due", "--in", "0", "--user", USER_B).silent, true);
+  });
+});
+
+describe("the legacy ledger", () => {
+  /**
+   * A database in the state migration 2 leaves behind for a pre-existing ledger.
+   *
+   * Reproducing it through the CLI is not possible — the placeholder can never log
+   * in, which is the whole problem — so the row is written directly here. This is
+   * the only test that touches the file behind the CLI's back, and it does it to
+   * set up a state the CLI is supposed to be able to clean up.
+   */
+  function withLegacyRows(): string {
+    const path = emptyDb();
+    const db = new DatabaseSync(path);
+    db.exec("PRAGMA foreign_keys = ON");
+    db.exec(
+      "INSERT INTO users (telegram_user_id, display_name, authenticated_at, auth_epoch," +
+        " active, created_at) VALUES ('legacy', 'Legacy', NULL, 0, 1, '2025-01-01T00:00:00-03:00')",
+    );
+    const uid = Number(
+      (db.prepare("SELECT id FROM users WHERE telegram_user_id = 'legacy'").get() as
+        { id: number }).id,
+    );
+    db.exec(
+      `INSERT INTO accounts (user_id, name, type, created_at)
+         VALUES (${uid}, 'Carteira', 'cash', '2025-01-01T00:00:00-03:00')`,
+    );
+    db.exec(
+      `INSERT INTO categories (user_id, name, parent_id, type)
+         VALUES (${uid}, 'Alimentação', NULL, 'expense')`,
+    );
+    db.exec(
+      `INSERT INTO transactions (user_id, type, amount_cents, description, date,
+                                 account_id, created_at, updated_at)
+         VALUES (${uid}, 'expense', 4200, 'Gasto antigo', '2025-06-15',
+                 (SELECT id FROM accounts WHERE user_id = ${uid}),
+                 '2025-06-15T10:00:00-03:00', '2025-06-15T10:00:00-03:00')`,
+    );
+    db.close();
+    return path;
+  }
+
+  test("adopt-legacy hands the old rows to a real person", () => {
+    const db = withLegacyRows();
+    // Before: the history belongs to nobody reachable.
+    assert.equal(run(db, "ls", "--period", "all", "--user", USER_A).auth_required, true);
+
+    const r = ok(db, "auth", "adopt-legacy", "--user", USER_A);
+    assert.equal(r.action, "legacy_adopted");
+    assert.equal(r.created_user, true);
+    assert.ok(Number(r.rows) >= 3);
+
+    // The placeholder is gone.
+    const users = ok(db, "auth", "users").users as { telegram_user_id: string }[];
+    assert.deepEqual(users.map((u) => u.telegram_user_id), [USER_A]);
+
+    // One login, and the history is there.
+    login(db, USER_A, "Geovane");
+    const listed = ok(db, "ls", "--period", "all");
+    assert.equal(listed.total_count, 1);
+    assert.match(JSON.stringify(listed), /Gasto antigo/);
+    assert.equal(ok(db, "summary", "--period", "2025-06").expenses_cents, 4200);
+  });
+
+  test("adopt-legacy merges into somebody who has already logged in", () => {
+    const db = withLegacyRows();
+    login(db, USER_A, "Geovane");
+    // Seeded, but nothing of their own recorded yet — the normal case.
+    assert.equal(ok(db, "ls", "--period", "all").total_count, 0);
+
+    const r = ok(db, "auth", "adopt-legacy", "--user", USER_A);
+    assert.equal(r.created_user, false);
+    assert.ok(Number(r.discarded) > 0, "the seeded rows should have been cleared");
+    assert.equal(ok(db, "ls", "--period", "all").total_count, 1);
+    assert.equal(ok(db, "auth", "users").count, 1);
+    // Still usable: a login fills back in whatever the old ledger lacked.
+    login(db, USER_A);
+    ok(db, "add", "--amount", "10", "--description", "novo", "--category", "Mercado");
+    assert.equal(ok(db, "ls", "--period", "all").total_count, 2);
+  });
+
+  test("adopt-legacy refuses to merge two real histories", () => {
+    const db = withLegacyRows();
+    login(db, USER_A, "Geovane");
+    ok(db, "add", "--amount", "50", "--description", "meu próprio", "--category", "Mercado");
+    assert.match(
+      fails(db, "auth", "adopt-legacy", "--user", USER_A),
+      /já tem lançamentos próprios/,
+    );
+    // Nothing moved, nothing lost.
+    assert.equal(ok(db, "ls", "--period", "all").total_count, 1);
+    assert.equal(ok(db, "auth", "users").count, 2);
+  });
+
+  test("adopt-legacy on a database with no legacy user", () => {
+    assert.match(
+      fails(freshDb(), "auth", "adopt-legacy", "--user", USER_A),
+      /Não há histórico antigo/,
+    );
+  });
+
+  test("adopt-legacy will not adopt into the placeholder itself", () => {
+    assert.match(
+      fails(withLegacyRows(), "auth", "adopt-legacy", "--user", "legacy"),
+      /legacy/,
+    );
   });
 });
 
@@ -745,6 +1310,28 @@ describe("accounts", () => {
     assert.match(fails(db, "account", "add", "--name", "X", "--type", "crypto"),
       /Tipo de conta inválido/);
   });
+
+  test("rm and default require --name instead of quietly doing nothing", () => {
+    // With no `--name` the name resolved to null, a `!` waved it through, and
+    // `UPDATE ... WHERE id = NULL` matched nothing — while the command answered
+    // `ok: true`. `default` was worse: it threw a raw TypeError about reading
+    // properties of undefined.
+    const db = freshDb();
+    ok(db, "account", "add", "--name", "Inter");
+    assert.match(fails(db, "account", "rm"), /--name/);
+    assert.match(fails(db, "account", "default"), /--name/);
+    // Nothing happened: both accounts are still there and the default is unchanged.
+    assert.equal((ok(db, "balance").accounts as unknown[]).length, 2);
+    assert.equal(tx(ok(db, "add", "--amount", "10", "--description", "x")).account,
+      "Carteira");
+  });
+
+  test("category rm requires --name too", () => {
+    const db = freshDb();
+    const before = ok(db, "category", "list").count;
+    assert.match(fails(db, "category", "rm"), /--name/);
+    assert.equal(ok(db, "category", "list").count, before);
+  });
 });
 
 describe("queries and export", () => {
@@ -784,19 +1371,32 @@ describe("queries and export", () => {
 
   test("CSV export opens in Excel in Portuguese", () => {
     const db = populated();
-    const dest = mkdtempSync(join(tmpdir(), "tally-export-"));
+    const dest = exportDir(db, "csv");
     const r = ok(db, "export", "--period", "month", "--format", "csv", "--dest", dest);
     assert.equal(r.count, 3);
     const content = readFileSync(r.file as string, "utf8");
     assert.ok(content.startsWith("﻿"), "missing the BOM Excel expects");
     assert.match(content, /id;data;tipo/);
     assert.match(content, /100,00/);
+    // The spreadsheet has to distinguish a bill from a payment, or the month adds
+    // up to something the user never spent.
+    assert.match(content, /;situacao;/);
+    assert.match(content, /;pago;/);
+  });
+
+  test("an unpaid bill exports as 'a pagar'", () => {
+    const db = freshDb();
+    ok(db, "recurring", "add", "--description", "Aluguel", "--amount", "1500",
+      "--category", "Aluguel", "--day", today().slice(8));
+    ok(db, "recurring", "apply");
+    const r = ok(db, "export", "--period", "month", "--dest", exportDir(db, "pending"));
+    assert.match(readFileSync(r.file as string, "utf8"), /;a pagar;/);
   });
 
   test("JSON and MD export", () => {
     const db = populated();
     for (const format of ["json", "md"]) {
-      const dest = mkdtempSync(join(tmpdir(), "tally-export-"));
+      const dest = exportDir(db, format);
       const r = ok(db, "export", "--period", "month", "--format", format, "--dest", dest);
       assert.ok(existsSync(r.file as string));
     }
@@ -805,34 +1405,819 @@ describe("queries and export", () => {
   test("invalid export format", () => {
     assert.match(fails(freshDb(), "export", "--format", "pdf"), /Formato inválido/);
   });
+
+  test("export with no --dest writes next to the database", () => {
+    const db = populated();
+    const r = ok(db, "export", "--period", "month");
+    assert.equal(dirname(r.file as string), exportDir(db));
+  });
+
+  test("--dest outside the data directory is refused", () => {
+    // It used to be used verbatim: `--dest ../../pwned` really did write a copy
+    // of somebody's whole month wherever the caller pointed it.
+    const db = populated();
+    const outside = mkdtempSync(join(tmpdir(), "tally-elsewhere-"));
+    for (const dest of [outside, join(dirname(db), "..", "escape"), "/tmp"]) {
+      assert.match(
+        fails(db, "export", "--period", "month", "--dest", dest),
+        /pasta de dados/,
+        `--dest ${dest} was accepted`,
+      );
+    }
+    assert.equal(existsSync(join(outside, "exports")), false);
+  });
+
+  test("a subdirectory of the data directory is fine", () => {
+    const db = populated();
+    const r = ok(db, "export", "--period", "month", "--dest", exportDir(db, "sub/deeper"));
+    assert.ok(existsSync(r.file as string));
+  });
 });
 
 describe("schema", () => {
-  test("init is idempotent", () => {
+  test("init is idempotent and only touches the schema", () => {
     const dir = mkdtempSync(join(tmpdir(), "tally-schema-"));
     const path = join(dir, "x.db");
-    assert.deepEqual(ok(path, "init").migrations_applied, [1]);
+    const first = ok(path, "init");
+    assert.deepEqual(first.migrations_applied, [1, 2, 3]);
+    assert.equal(first.schema_version, 3);
     const second = ok(path, "init");
     assert.deepEqual(second.migrations_applied, []);
-    const seeded = second.seed as { categories: number };
-    assert.equal(seeded.categories, 0);
+    // Seeding moved to registration: `init` must not create a user, a category
+    // or an account of its own.
+    assert.equal(ok(path, "auth", "users").count, 0);
   });
 
-  test("any command auto-migrates a fresh database", () => {
-    // The agent may call any command first, with no `init` beforehand.
+  test("auth login auto-migrates a fresh database", () => {
+    // The first thing that ever happens may be a login, with no `init` first.
     const dir = mkdtempSync(join(tmpdir(), "tally-schema-"));
-    const r = ok(join(dir, "new.db"), "add", "--amount", "10", "--description", "first");
-    assert.equal(tx(r).id, 1);
+    const path = join(dir, "new.db");
+    const r = login(path, USER_A);
+    assert.equal(r.new_user, true);
+    const r2 = ok(path, "add", "--amount", "10", "--description", "first");
+    assert.equal(tx(r2).id, 1);
   });
 
-  test("categories are seeded in Portuguese", () => {
+  test("categories are seeded in Portuguese, per user", () => {
     const r = ok(freshDb(), "category", "list");
     const categories = r.categories as Record<string, { children: string[] }>;
     assert.ok(categories["Alimentação"]);
     assert.ok(categories["Alimentação"].children.includes("Delivery"));
   });
 
+  test("registering seeds that user's own taxonomy and wallet", () => {
+    const db = freshDb();
+    const before = ok(db, "category", "list").count as number;
+    const r = login(db, USER_B, "Namorada");
+    const seeded = r.seed as { categories: number; accounts: number };
+    assert.equal(seeded.categories, 17);
+    assert.equal(seeded.accounts, 1);
+    // A separate set of rows, not a shared one.
+    assert.equal(ok(db, "category", "list", "--user", USER_B).count, before);
+    const wallet = (ok(db, "balance", "--user", USER_B).accounts as { name: string }[])[0];
+    assert.equal(wallet.name, "Carteira");
+  });
+
+  test("logging in again does not duplicate the seed", () => {
+    const db = freshDb();
+    const again = login(db, USER_A);
+    assert.equal(again.new_user, false);
+    assert.deepEqual(again.seed, { categories: 0, subcategories: 0, accounts: 0 });
+  });
+
   test("unknown subcommand", () => {
     assert.match(fails(freshDb(), "invest", "--amount", "10"), /desconhecido/);
+  });
+});
+
+describe("authentication", () => {
+  test("an unregistered user is refused, with auth_required", () => {
+    const db = emptyDb();
+    const r = run(db, "ls", "--user", "999999999");
+    assert.equal(r.ok, false);
+    assert.equal(r.auth_required, true);
+    assert.match(r.error!, /código de acesso/i);
+  });
+
+  test("every data subcommand is gated, not just the writes", () => {
+    const db = emptyDb();
+    const commands = [
+      ["add", "--amount", "10", "--description", "x"],
+      ["edit", "1", "--amount", "10"],
+      ["rm", "1"],
+      ["ls"],
+      ["search", "x"],
+      ["balance"],
+      ["summary"],
+      ["report"],
+      ["budget", "status"],
+      ["alerts"],
+      ["account", "list"],
+      ["category", "list"],
+      ["recurring", "list"],
+      ["recurring", "apply"],
+      ["goal", "list"],
+      ["export"],
+    ];
+    for (const args of commands) {
+      const r = run(db, ...args, "--user", "999999999");
+      assert.equal(r.ok, false, `${args[0]} let an unauthenticated caller through`);
+      assert.equal(r.auth_required, true, `${args[0]} did not ask for the code`);
+    }
+  });
+
+  test("a revoked session looks exactly like an unknown one", () => {
+    // Same shape for both, so the agent has a single case to handle and nobody
+    // can probe which ids are registered.
+    const db = freshDb();
+    ok(db, "auth", "logout-all");
+    const revoked = run(db, "balance", "--user", USER_A);
+    const unknown = run(db, "balance", "--user", "888888888");
+    assert.equal(revoked.error, unknown.error);
+    assert.equal(revoked.auth_required, true);
+    assert.equal(unknown.auth_required, true);
+  });
+
+  test("the wrong code is refused, the right one authenticates", () => {
+    const db = emptyDb();
+    const bad = run(db, "auth", "login", "--user", USER_A, "--code", "chute");
+    assert.equal(bad.ok, false);
+    assert.match(bad.error!, /Código incorreto/);
+    assert.equal(run(db, "ls", "--user", USER_A).auth_required, true);
+
+    login(db, USER_A);
+    assert.equal(ok(db, "ls", "--user", USER_A).ok, true);
+  });
+
+  test("a wrong code says the same thing whether or not the id is known", () => {
+    // Otherwise the message itself would tell an outsider which ids exist.
+    const db = freshDb();
+    const known = run(db, "auth", "login", "--user", USER_A, "--code", "chute");
+    const unknown = run(db, "auth", "login", "--user", "777777777", "--code", "chute");
+    assert.equal(known.error, unknown.error);
+  });
+
+  test("the access code never appears in any output", () => {
+    // Both streams. stdout is the contract, but a stack trace or a warning goes
+    // to stderr, and the gateway captures both — a code echoed there is just as
+    // leaked.
+    //
+    // Known limitation, not something this test can cover: `--code <value>` is an
+    // argv entry, so it is visible to anyone who can run `ps` on the host for as
+    // long as the process lives, and it may land in a shell history. Fixing that
+    // means reading the code from stdin instead of an option, which the agent's
+    // terminal tool cannot currently do.
+    const db = emptyDb();
+    const outputs = [
+      run(db, "auth", "login", "--user", USER_A, "--code", "errado"),
+      run(db, "auth", "login", "--user", USER_A, "--code", CODE),
+      run(db, "auth", "status", "--user", USER_A),
+      run(db, "auth", "users"),
+      run(db, "auth", "status"),
+      run(db, "auth", "logout-all"),
+      run(db, "ls", "--user", USER_A),
+      run(db, "balance", "--user", USER_A),
+      // The failure paths too: an unexpected error is where a value tends to
+      // escape into a message.
+      run(db, "auth", "login", "--user", "nao-numerico", "--code", CODE),
+      run(db, "auth", "renew", "--user", USER_A, "--code", CODE),
+    ];
+    for (const r of outputs) {
+      const text = `${JSON.stringify(r)}\n${r._stderr}`;
+      assert.ok(!text.includes(CODE), `the code leaked into: ${text.slice(0, 200)}`);
+      // Nor its hash, nor the variable's name.
+      assert.ok(!text.includes("TALLY_ACCESS_CODE"), "the variable name leaked");
+    }
+  });
+
+  test("a missing code is asked for, not guessed", () => {
+    const db = emptyDb();
+    assert.match(fails(db, "auth", "login", "--user", USER_A), /código/i);
+  });
+
+  test("five wrong codes lock the account, and the right code no longer works", () => {
+    const db = emptyDb();
+    for (let i = 0; i < 4; i++) {
+      assert.match(
+        fails(db, "auth", "login", "--user", USER_A, "--code", `chute-${i}`),
+        /Código incorreto/,
+      );
+    }
+    // The fifth is what trips it.
+    assert.match(
+      fails(db, "auth", "login", "--user", USER_A, "--code", "chute-4"),
+      /Bloqueei as tentativas/,
+    );
+    // And the correct code is refused too, until the lock is lifted.
+    assert.match(
+      fails(db, "auth", "login", "--user", USER_A, "--code", CODE),
+      /Bloqueei as tentativas/,
+    );
+    assert.equal(ok(db, "auth", "status", "--user", USER_A).locked, true);
+  });
+
+  test("a wrong code creates no user row for the id that got it wrong", () => {
+    // The counter lives in app_state now. It used to be a column on `users`,
+    // which meant every guessed id planted a permanent row — free pollution of
+    // the list cron fans out over.
+    const db = emptyDb();
+    for (const id of ["987654321", "987654322", "987654323"]) {
+      fails(db, "auth", "login", "--user", id, "--code", "chute");
+    }
+    assert.equal(ok(db, "auth", "users").count, 0);
+    assert.equal(ok(db, "auth", "status", "--user", "987654321").registered, false);
+  });
+
+  test("a new --user does not buy five fresh attempts", () => {
+    // Bypass (a) of the old lockout: the per-id counter is keyed by something the
+    // caller chooses, so cycling ids meant unlimited guesses. The global counter
+    // is what closes it — 20 wrong codes and nobody gets to try, whatever id they
+    // claim.
+    const db = emptyDb();
+    let locked = false;
+    for (let i = 0; i < 20; i++) {
+      // A different id every time: each one is on its first attempt.
+      const message = fails(db, "auth", "login", "--user", `9000000${10 + i}`, "--code", "x");
+      if (/Bloqueei as tentativas/.test(message)) locked = true;
+    }
+    assert.equal(locked, true, "20 wrong codes across 20 ids did not lock anything");
+    // A brand-new id, first attempt, correct code: still refused.
+    assert.match(
+      fails(db, "auth", "login", "--user", "555000111", "--code", CODE),
+      /Bloqueei as tentativas/,
+    );
+  });
+
+  test("logout-all does not lift a lockout", () => {
+    // Bypass (b): `logout-all` used to zero every failure counter, and it needs
+    // no authentication — so the lockout was undone by the one command anybody
+    // could run. Lifting a lock is `auth unlock` now, and nothing else.
+    const db = emptyDb();
+    for (let i = 0; i < 5; i++) {
+      fails(db, "auth", "login", "--user", USER_A, "--code", "chute");
+    }
+    ok(db, "auth", "logout-all");
+    assert.match(
+      fails(db, "auth", "login", "--user", USER_A, "--code", CODE),
+      /Bloqueei as tentativas/,
+    );
+    assert.equal(ok(db, "auth", "status", "--user", USER_A).locked, true);
+  });
+
+  test("auth unlock is what lifts a lockout", () => {
+    const db = emptyDb();
+    for (let i = 0; i < 5; i++) {
+      fails(db, "auth", "login", "--user", USER_A, "--code", "chute");
+    }
+    const r = ok(db, "auth", "unlock", "--user", USER_A);
+    assert.equal(r.attempts_cleared, 5);
+    login(db, USER_A);
+    assert.equal(ok(db, "auth", "status", "--user", USER_A).current, true);
+  });
+
+  test("auth unlock needs to be told who", () => {
+    assert.match(fails(emptyDb(), "auth", "unlock"), /--user/);
+  });
+
+  test("a correct login resets the failure count", () => {
+    const db = emptyDb();
+    fails(db, "auth", "login", "--user", USER_A, "--code", "chute");
+    fails(db, "auth", "login", "--user", USER_A, "--code", "chute");
+    login(db, USER_A);
+    // Four more wrong ones must not trip the lock, since the counter went back
+    // to zero.
+    for (let i = 0; i < 4; i++) {
+      assert.match(
+        fails(db, "auth", "login", "--user", USER_A, "--code", "chute"),
+        /Código incorreto/,
+      );
+    }
+  });
+
+  test("logout-all invalidates every session and keeps every transaction", () => {
+    const db = sharedDb();
+    ok(db, "add", "--amount", "100", "--description", "Mercado", "--category", "Mercado");
+    ok(db, "add", "--amount", "50", "--description", "Bar", "--category", "Bar",
+      "--user", USER_B);
+
+    const out = ok(db, "auth", "logout-all");
+    assert.equal(out.sessions_invalidated, 2);
+    assert.equal(out.auth_epoch, 1);
+
+    for (const user of [USER_A, USER_B]) {
+      assert.equal(run(db, "ls", "--user", user).auth_required, true);
+    }
+
+    // The data was never touched: it is all there after re-authenticating.
+    login(db, USER_A);
+    login(db, USER_B);
+    assert.equal(ok(db, "ls", "--period", "all").total_count, 1);
+    assert.equal(ok(db, "summary", "--period", "month").expenses_cents, 10000);
+    assert.equal(ok(db, "ls", "--period", "all", "--user", USER_B).total_count, 1);
+    assert.equal(
+      ok(db, "summary", "--period", "month", "--user", USER_B).expenses_cents,
+      5000,
+    );
+  });
+
+  test("logout-all counts only the sessions that were live", () => {
+    const db = freshDb();
+    ok(db, "auth", "logout-all");
+    assert.equal(ok(db, "auth", "logout-all").sessions_invalidated, 0);
+  });
+
+  test("auth status, for one person and for everyone", () => {
+    const db = sharedDb();
+    const one = ok(db, "auth", "status", "--user", USER_A);
+    assert.equal(one.registered, true);
+    assert.equal(one.current, true);
+
+    const stranger = ok(db, "auth", "status", "--user", "555555555");
+    assert.equal(stranger.registered, false);
+    assert.equal(stranger.current, false);
+
+    const all = ok(db, "auth", "status");
+    assert.equal(all.count, 2);
+    assert.equal(all.current_count, 2);
+  });
+
+  test("auth users is clean machine-readable JSON for the cron fan-out", () => {
+    const db = sharedDb();
+    const r = ok(db, "auth", "users");
+    assert.equal(r.count, 2);
+    const users = r.users as Record<string, unknown>[];
+    assert.deepEqual(
+      users.map((u) => u.telegram_user_id),
+      [USER_A, USER_B],
+    );
+    assert.deepEqual(
+      users.map((u) => u.display_name),
+      ["Geovane", "Namorada"],
+    );
+    for (const u of users) {
+      assert.equal(u.authenticated, true);
+      assert.equal(u.current, true);
+      assert.equal(u.active, true);
+      // What `--deliver telegram:<chat_id>` will consume. In a private chat it
+      // is the person's own id.
+      assert.equal(u.telegram_chat_id, u.telegram_user_id);
+      assert.ok(!("failed_attempts" in u));
+    }
+  });
+
+  test("unknown auth action", () => {
+    assert.match(fails(freshDb(), "auth", "renew"), /desconhecida/);
+  });
+});
+
+describe("who is calling", () => {
+  test("the session's id is what counts, with no --user at all", () => {
+    const db = emptyDb();
+    const session = { HERMES_SESSION_USER_ID: USER_A, HERMES_SESSION_CHAT_TYPE: "dm" };
+    assert.equal(
+      spawn(db, ["auth", "login", "--code", CODE, "--name", "Geovane"], session).ok,
+      true,
+    );
+    const r = spawn(db, ["auth", "status"], session);
+    assert.equal(r.telegram_user_id, USER_A);
+    assert.equal(r.identity_source, "session");
+    assert.equal(r.current, true);
+
+    ok(db, "add", "--amount", "42", "--description", "Uber", "--user", USER_A);
+    assert.equal(spawn(db, ["ls", "--period", "all"], session).total_count, 1);
+  });
+
+  test("a --user that disagrees with the session is refused", () => {
+    // The anti-impersonation control: no silent preference for either value.
+    const db = sharedDb();
+    const r = spawn(db, ["balance", "--user", USER_B], {
+      HERMES_SESSION_USER_ID: USER_A,
+    });
+    assert.equal(r.ok, false);
+    assert.match(r.error!, /outra pessoa/);
+    assert.notEqual(r.auth_required, true);
+  });
+
+  test("a --user that merely repeats the session is fine", () => {
+    const db = freshDb();
+    const r = spawn(db, ["balance", "--user", USER_A], {
+      HERMES_SESSION_USER_ID: USER_A,
+    });
+    assert.equal(r.ok, true);
+  });
+
+  test("an empty session id is not an identity", () => {
+    // Hermes leaves it empty on its anonymised path; falling back to "" would
+    // pool every anonymous caller into one ledger.
+    const db = freshDb();
+    const r = spawn(db, ["balance"], { HERMES_SESSION_USER_ID: "" });
+    assert.equal(r.ok, false);
+    assert.match(r.error!, /identificar/);
+  });
+
+  test("no identity at all is refused, and nothing is created", () => {
+    const db = freshDb();
+    const r = spawn(db, ["add", "--amount", "10", "--description", "x"]);
+    assert.equal(r.ok, false);
+    assert.match(r.error!, /identificar/);
+    assert.equal(ok(db, "ls", "--period", "all").total_count, 0);
+  });
+
+  test("a private chat id stands in for a missing user id", () => {
+    const db = emptyDb();
+    const session = {
+      HERMES_SESSION_USER_ID: undefined,
+      HERMES_SESSION_CHAT_ID: USER_A,
+      HERMES_SESSION_CHAT_TYPE: "dm",
+    };
+    assert.equal(spawn(db, ["auth", "login", "--code", CODE], session).ok, true);
+    assert.equal(spawn(db, ["auth", "status"], session).telegram_user_id, USER_A);
+  });
+
+  test("a group chat id never stands in for a person", () => {
+    const db = freshDb();
+    const r = spawn(db, ["balance"], {
+      HERMES_SESSION_USER_ID: undefined,
+      HERMES_SESSION_CHAT_ID: "-100200300",
+      HERMES_SESSION_CHAT_TYPE: "group",
+    });
+    assert.equal(r.ok, false);
+    assert.match(r.error!, /identificar/);
+  });
+
+  test("--user works outside a session, which is what cron and the Makefile use", () => {
+    // Documented deliberately: with no session identity at all, `--user` is
+    // honoured with nothing else to check it against. That is not a hole being
+    // tolerated, it is the operator path — `make balance TG_USER=…` and every cron
+    // prompt depend on it, because a cron run has no inbound message and therefore
+    // no session to bind.
+    //
+    // It is also why none of this is a security boundary: the agent holds a shell
+    // as the same uid, so `env -u HERMES_SESSION_USER_ID node fin.ts ... --user
+    // <other person>` is always available to it, as is opening tally.db directly.
+    // The boundary is the Hermes gateway allowlist, one level up. What the checks
+    // here buy is that the ordinary path cannot go wrong by accident, and that
+    // going around it takes a visibly strange command.
+    const db = freshDb();
+    assert.equal(spawn(db, ["balance", "--user", USER_A]).ok, true);
+    assert.equal(spawn(db, ["auth", "users"]).ok, true);
+  });
+
+  test("--user has to look like a Telegram id", () => {
+    const db = freshDb();
+    for (const bad of ["geovane", "12", "1234567890123456789012", "111111111 ; ls", "1e9"]) {
+      const r = spawn(db, ["balance", "--user", bad]);
+      assert.equal(r.ok, false, `--user ${JSON.stringify(bad)} was accepted`);
+      assert.match(r.error!, /id numérico/);
+      // Not the auth prompt: this is a malformed call, not a missing session.
+      assert.notEqual(r.auth_required, true);
+    }
+    // A group chat id is negative, and `--user -100…` never even reaches the
+    // validation — parseArgs rejects a value that looks like another option. The
+    // `=` form is the one that gets through to it.
+    const negative = spawn(db, ["balance", "--user=-100200300"]);
+    assert.equal(negative.ok, false);
+    assert.match(negative.error!, /id numérico/);
+  });
+
+  test("--user legacy is refused by name", () => {
+    // Migration 2 parks pre-multi-user rows under a placeholder called `legacy`.
+    // `--user legacy` used to walk straight into that ledger.
+    const db = freshDb();
+    const r = spawn(db, ["ls", "--user", "legacy"]);
+    assert.equal(r.ok, false);
+    assert.match(r.error!, /legacy/);
+    assert.match(r.error!, /adopt-legacy/);
+  });
+
+  test("operator commands refuse to run inside a chat turn", () => {
+    // Nothing here needed any authentication before: a message could ask the bot
+    // to list both people's Telegram ids and chat ids, or to log everybody out on
+    // repeat. They are host commands, so they refuse when the gateway bound a
+    // session — which is the only situation where a chat is what is asking.
+    //
+    // A guardrail, not a boundary: the agent can drop the variable. It stops the
+    // bot doing this *because it was asked to*.
+    const db = sharedDb();
+    const session = { HERMES_SESSION_USER_ID: USER_A, HERMES_SESSION_CHAT_TYPE: "dm" };
+
+    // `auth status` is not in this list on purpose: with a session it scopes to
+    // the caller instead of refusing (see the next test). Only its everybody form
+    // is operator-only, and that form cannot be reached with a session bound.
+    for (const args of [
+      ["auth", "users"],
+      ["auth", "logout-all"],
+      ["auth", "unlock", "--user", USER_A],
+      ["auth", "adopt-legacy", "--user", USER_A],
+    ]) {
+      const r = spawn(db, args, session);
+      assert.equal(r.ok, false, `${args.join(" ")} ran from inside a session`);
+      assert.match(r.error!, /operador/);
+      assert.ok(!JSON.stringify(r).includes(USER_B), "the other person leaked anyway");
+    }
+
+    // Still live afterwards: `logout-all` did not take effect.
+    assert.equal(spawn(db, ["balance"], session).ok, true);
+  });
+
+  test("auth status with a session shows only the caller", () => {
+    const db = sharedDb();
+    const r = spawn(db, ["auth", "status"], {
+      HERMES_SESSION_USER_ID: USER_A,
+      HERMES_SESSION_CHAT_TYPE: "dm",
+    });
+    assert.equal(r.ok, true);
+    assert.equal(r.telegram_user_id, USER_A);
+    assert.equal(r.current, true);
+    // No roster, no count, no sign of anyone else.
+    assert.equal(r.users, undefined);
+    assert.equal(r.count, undefined);
+    assert.ok(!JSON.stringify(r).includes(USER_B));
+  });
+
+  test("the private-chat fallback counts as a session for the operator check", () => {
+    // Same reasoning as above: a dm whose chat id stands in for the user id is
+    // still a chat turn, so the operator commands stay shut.
+    const db = sharedDb();
+    const r = spawn(db, ["auth", "users"], {
+      HERMES_SESSION_USER_ID: undefined,
+      HERMES_SESSION_CHAT_ID: USER_A,
+      HERMES_SESSION_CHAT_TYPE: "dm",
+    });
+    assert.equal(r.ok, false);
+    assert.match(r.error!, /operador/);
+  });
+});
+
+describe("isolation between the two people", () => {
+  /** Both ledgers populated, deliberately using the same account name. */
+  function populatedPair(): string {
+    const db = sharedDb();
+
+    ok(db, "account", "add", "--name", "Nubank", "--type", "card", "--limit", "5000");
+    ok(db, "add", "--amount", "100", "--description", "Mercado dela-nao",
+      "--category", "Mercado", "--tags", "meu", "--account", "Nubank");
+    ok(db, "add", "--type", "income", "--amount", "7000", "--description", "Salário A",
+      "--category", "Salário");
+    ok(db, "budget", "set", "--category", "Alimentação", "--limit", "150");
+    ok(db, "goal", "add", "--name", "Notebook", "--target", "5000");
+    ok(db, "category", "add", "--name", "Cerveja artesanal", "--parent", "Lazer");
+    ok(db, "recurring", "add", "--description", "Aluguel A", "--amount", "1500",
+      "--category", "Aluguel", "--day", "10");
+
+    const b = (...args: string[]) => ok(db, ...args, "--user", USER_B);
+    b("account", "add", "--name", "Nubank", "--type", "checking");
+    b("add", "--amount", "40", "--description", "Bar dele-nao", "--category", "Bar",
+      "--tags", "dela", "--account", "Nubank");
+    b("add", "--type", "income", "--amount", "3000", "--description", "Salário B",
+      "--category", "Salário");
+    b("budget", "set", "--category", "Lazer", "--limit", "80");
+    b("goal", "add", "--name", "Viagem", "--target", "9000");
+    b("category", "add", "--name", "Cerâmica", "--parent", "Lazer");
+    b("recurring", "add", "--description", "Academia B", "--amount", "120",
+      "--category", "Academia", "--day", "5");
+
+    return db;
+  }
+
+  test("listings show only your own transactions", () => {
+    const db = populatedPair();
+    const mine = ok(db, "ls", "--period", "all");
+    assert.equal(mine.total_count, 2);
+    const text = JSON.stringify(mine);
+    assert.ok(!text.includes("Bar dele-nao"));
+    assert.ok(!text.includes("Salário B"));
+
+    const hers = ok(db, "ls", "--period", "all", "--user", USER_B);
+    assert.equal(hers.total_count, 2);
+    assert.ok(!JSON.stringify(hers).includes("Mercado dela-nao"));
+  });
+
+  test("summary, report and balance never mix the two", () => {
+    const db = populatedPair();
+
+    const sumA = ok(db, "summary", "--period", "month");
+    assert.equal(sumA.expenses_cents, 10000);
+    assert.equal(sumA.income_cents, 700000);
+
+    const sumB = ok(db, "summary", "--period", "month", "--user", USER_B);
+    assert.equal(sumB.expenses_cents, 4000);
+    assert.equal(sumB.income_cents, 300000);
+
+    const reportA = ok(db, "report", "--period", "month").text as string;
+    assert.match(reportA, /R\$ 100,00/);
+    assert.ok(!reportA.includes("Bar dele-nao"));
+    const reportB = ok(db, "report", "--period", "month", "--user", USER_B).text as string;
+    assert.ok(!reportB.includes("Mercado dela-nao"));
+
+    // Same account name on both sides, separate balances.
+    const nubankA = (ok(db, "balance").accounts as Record<string, unknown>[])
+      .find((c) => c.name === "Nubank")!;
+    const nubankB = (ok(db, "balance", "--user", USER_B).accounts as Record<string, unknown>[])
+      .find((c) => c.name === "Nubank")!;
+    assert.notEqual(nubankA.id, nubankB.id);
+    assert.equal(nubankA.type, "card");
+    assert.equal(nubankB.type, "checking");
+    assert.equal(nubankA.balance_cents, -10000);
+    assert.equal(nubankB.balance_cents, -4000);
+    // Two accounts each (Carteira + Nubank), never four.
+    assert.equal((ok(db, "balance").accounts as unknown[]).length, 2);
+  });
+
+  test("both can name an account Nubank without colliding", () => {
+    const db = sharedDb();
+    ok(db, "account", "add", "--name", "Nubank");
+    // The UNIQUE is per user, so this is not a duplicate.
+    ok(db, "account", "add", "--name", "Nubank", "--user", USER_B);
+    // But a second one for the same person still is.
+    assert.match(fails(db, "account", "add", "--name", "Nubank"), /Já existe/);
+  });
+
+  test("budget statuses are computed from your spending only", () => {
+    const db = populatedPair();
+    const a = ok(db, "budget", "status").budgets as
+      { category: string; spent_cents: number }[];
+    assert.equal(a.length, 1);
+    assert.equal(a[0].category, "Alimentação");
+    assert.equal(a[0].spent_cents, 10000);
+
+    const b = ok(db, "budget", "status", "--user", USER_B).budgets as
+      { category: string; spent_cents: number }[];
+    assert.equal(b.length, 1);
+    assert.equal(b[0].category, "Lazer");
+    assert.equal(b[0].spent_cents, 4000);
+  });
+
+  test("alerts fire per person and are marked per person", () => {
+    const db = sharedDb();
+    ok(db, "budget", "set", "--category", "Lazer", "--limit", "100");
+    ok(db, "budget", "set", "--category", "Lazer", "--limit", "100", "--user", USER_B);
+    ok(db, "add", "--amount", "150", "--description", "Show", "--category", "Eventos");
+    // B has a limit and is spending against it, comfortably inside — so her
+    // `silent` below means "her budget is fine", not "she has no data". With no
+    // spending at all the assertion would pass for a reason that has nothing to do
+    // with the alert being scoped per person.
+    ok(db, "add", "--amount", "20", "--description", "Bar", "--category", "Bar",
+      "--user", USER_B);
+
+    assert.equal(ok(db, "alerts", "--mark").count, 1);
+    assert.equal(ok(db, "alerts").silent, true);
+    // Marking A's alert must not silence B's, and B's own limit is at 20%.
+    const hers = ok(db, "alerts", "--user", USER_B);
+    assert.equal(hers.silent, true);
+    assert.equal(
+      (ok(db, "budget", "status", "--user", USER_B).budgets as { pct: number }[])[0].pct,
+      20,
+    );
+
+    ok(db, "add", "--amount", "150", "--description", "Show", "--category", "Eventos",
+      "--user", USER_B);
+    assert.equal(ok(db, "alerts", "--user", USER_B).count, 1);
+  });
+
+  test("search and tags do not cross over", () => {
+    const db = populatedPair();
+    assert.equal(ok(db, "search", "Bar").count, 0);
+    assert.equal(ok(db, "search", "Bar", "--user", USER_B).count, 1);
+    assert.equal(ok(db, "ls", "--tag", "dela").total_count, 0);
+    assert.equal(ok(db, "ls", "--tag", "dela", "--user", USER_B).total_count, 1);
+    assert.equal(ok(db, "ls", "--tag", "meu").total_count, 1);
+  });
+
+  test("goals, categories and fixed costs stay separate", () => {
+    const db = populatedPair();
+    const goalsA = ok(db, "goal", "list").goals as { name: string }[];
+    assert.deepEqual(goalsA.map((g) => g.name), ["Notebook"]);
+    const goalsB = ok(db, "goal", "list", "--user", USER_B).goals as { name: string }[];
+    assert.deepEqual(goalsB.map((g) => g.name), ["Viagem"]);
+
+    // A goal only the other person has is not depositable into.
+    assert.match(
+      fails(db, "goal", "deposit", "--name", "Viagem", "--amount", "10"),
+      /Não achei/,
+    );
+    // And both may use the same goal name.
+    ok(db, "goal", "add", "--name", "Viagem", "--target", "1000");
+
+    const catsA = ok(db, "category", "list").categories as Record<string, { children: string[] }>;
+    assert.ok(catsA["Lazer"].children.includes("Cerveja artesanal"));
+    assert.ok(!catsA["Lazer"].children.includes("Cerâmica"));
+
+    const recA = ok(db, "recurring", "list").recurring as { description: string }[];
+    assert.deepEqual(recA.map((r) => r.description), ["Aluguel A"]);
+    assert.equal(ok(db, "recurring", "list").count, 1);
+    const recB = ok(db, "recurring", "list", "--user", USER_B).recurring as
+      { description: string }[];
+    assert.deepEqual(recB.map((r) => r.description), ["Academia B"]);
+  });
+
+  test("recurring apply only posts your own fixed costs", () => {
+    const db = sharedDb();
+    // Due today, so `apply` has something to do on any day of the month.
+    const dueToday = today().slice(8);
+    ok(db, "recurring", "add", "--description", "Aluguel A", "--amount", "1500",
+      "--category", "Aluguel", "--day", dueToday);
+    ok(db, "recurring", "add", "--description", "Academia B", "--amount", "120",
+      "--category", "Academia", "--day", dueToday, "--user", USER_B);
+
+    ok(db, "recurring", "apply");
+    assert.equal(ok(db, "ls", "--period", "all").total_count, 1);
+    // B's entry was not generated by A's run.
+    assert.equal(ok(db, "ls", "--period", "all", "--user", USER_B).total_count, 0);
+
+    ok(db, "recurring", "apply", "--user", USER_B);
+    const hers = ok(db, "ls", "--period", "all", "--user", USER_B);
+    assert.equal(hers.total_count, 1);
+    assert.match(JSON.stringify(hers), /Academia B/);
+  });
+
+  test("an export contains only your own rows, in your own file", () => {
+    const db = populatedPair();
+    const dest = exportDir(db, "pair");
+    const a = ok(db, "export", "--period", "month", "--dest", dest);
+    const b = ok(db, "export", "--period", "month", "--dest", dest, "--user", USER_B);
+
+    assert.equal(a.count, 2);
+    assert.equal(b.count, 2);
+    // Different files: one overwriting the other would attach the wrong
+    // spreadsheet to the wrong chat.
+    assert.notEqual(a.file, b.file);
+
+    const contentA = readFileSync(a.file as string, "utf8");
+    assert.match(contentA, /Mercado dela-nao/);
+    assert.ok(!contentA.includes("Bar dele-nao"));
+
+    const contentB = readFileSync(b.file as string, "utf8");
+    assert.match(contentB, /Bar dele-nao/);
+    assert.ok(!contentB.includes("Mercado dela-nao"));
+  });
+
+  test("a transaction id from the other person cannot be edited", () => {
+    // The sharpest failure mode: a raw id is all it would take.
+    const db = sharedDb();
+    const mine = ok(db, "add", "--amount", "100", "--description", "Meu",
+      "--category", "Mercado");
+    const hers = ok(db, "add", "--amount", "40", "--description", "Dela",
+      "--category", "Bar", "--user", USER_B);
+    assert.notEqual(mine.id, hers.id);
+
+    assert.match(
+      fails(db, "edit", String(hers.id), "--amount", "999"),
+      new RegExp(`#${hers.id}`),
+    );
+    // Untouched, not silently changed.
+    const stillHers = ok(db, "ls", "--period", "all", "--user", USER_B)
+      .transactions as { amount_cents: number; description: string }[];
+    assert.equal(stillHers[0].amount_cents, 4000);
+    assert.equal(stillHers[0].description, "Dela");
+  });
+
+  test("a transaction id from the other person cannot be deleted", () => {
+    const db = sharedDb();
+    ok(db, "add", "--amount", "100", "--description", "Meu", "--category", "Mercado");
+    const hers = ok(db, "add", "--amount", "40", "--description", "Dela",
+      "--category", "Bar", "--user", USER_B);
+
+    assert.match(fails(db, "rm", String(hers.id)), new RegExp(`#${hers.id}`));
+    assert.equal(ok(db, "ls", "--period", "all", "--user", USER_B).total_count, 1);
+  });
+
+  test("an instalment series belonging to the other person is not deletable by group", () => {
+    const db = sharedDb();
+    const hers = ok(db, "add", "--amount", "900", "--description", "TV dela",
+      "--category", "Eletrônicos", "--installments", "3", "--user", USER_B);
+    const firstId = (hers.installments as { id: number }[])[0].id;
+    assert.match(fails(db, "rm", String(firstId), "--group"), new RegExp(`#${firstId}`));
+    // Nothing was removed: she can still delete all three herself. (`--period
+    // all` would only show the first, since the other two fall in the future.)
+    assert.equal(ok(db, "rm", String(firstId), "--group", "--user", USER_B).count, 3);
+  });
+
+  test("the other person's transaction cannot be read by id either", () => {
+    const db = sharedDb();
+    const hers = ok(db, "add", "--amount", "40", "--description", "Dela",
+      "--category", "Bar", "--user", USER_B);
+    // `edit` with no field is the cheapest probe for "does this id exist"; it
+    // must not answer differently for somebody else's id.
+    const mine = ok(db, "add", "--amount", "10", "--description", "Meu");
+    assert.match(fails(db, "edit", String(mine.id)), /Nada para alterar/);
+    assert.match(fails(db, "edit", String(hers.id)), new RegExp(`#${hers.id}`));
+  });
+
+  test("a category from the other person is not usable as a filter", () => {
+    const db = sharedDb();
+    ok(db, "category", "add", "--name", "Cerâmica xyz", "--parent", "Lazer",
+      "--user", USER_B);
+    assert.match(fails(db, "ls", "--category", "Cerâmica xyz"), /não existe/);
+  });
+
+  test("the default account setting is per person", () => {
+    const db = sharedDb();
+    ok(db, "account", "add", "--name", "Inter");
+    ok(db, "account", "default", "--name", "Inter");
+    assert.equal(tx(ok(db, "add", "--amount", "10", "--description", "x")).account, "Inter");
+    // B never chose one, so she still gets her own wallet.
+    const hers = ok(db, "add", "--amount", "10", "--description", "x", "--user", USER_B);
+    assert.equal(tx(hers).account, "Carteira");
   });
 });
